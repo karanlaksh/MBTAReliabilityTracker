@@ -1,0 +1,21 @@
+name = "mbta-collector"
+main = "src/index.ts"
+compatibility_date = "2026-07-01"
+
+# Every minute. Data starts accumulating the day this goes live and lost days are
+# not recoverable, so uptime matters more than anything else in this file.
+[triggers]
+crons = ["* * * * *"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "mbta"
+# Filled in by: wrangler d1 create mbta
+database_id = "REPLACE_ME"
+
+[observability]
+enabled = true
+
+# Secrets, set with `wrangler secret put <NAME>` — never in this file:
+#   MBTA_API_KEY  optional; raises the rate limit from 20 to 1000 req/min
+#   COLLECT_TOKEN optional; enables POST /collect?token=… to trigger a tick
