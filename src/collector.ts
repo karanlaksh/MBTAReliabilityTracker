@@ -9,6 +9,7 @@
 import {
   MbtaClient,
   MbtaError,
+  attrArray,
   attrNumber,
   attrString,
   epochSec,
@@ -36,6 +37,19 @@ export interface RunRecord {
   vehicle_rows_written: number;
   api_status: number | null;
   error: string | null;
+  /**
+   * '<stop>|<route>|<direction>' -> predictions seen this tick, with an explicit
+   * 0 for every watched slice that returned none. The zero is the point: it is
+   * what distinguishes "this slice is suspended" from "the collector is broken".
+   */
+  per_slice_counts: Record<string, number>;
+  /**
+   * Not persisted — collector_runs has no column for these, deliberately.
+   * Alerts are low-volume and alert_snapshots can be read directly. These exist
+   * for the /collect response and logs.
+   */
+  alerts_seen: number;
+  alert_rows_written: number;
 }
 
 interface WatchedStop {
@@ -60,6 +74,95 @@ const VEHICLE_LINGER_SEC = 300;
 /** collector_runs retention, per CLAUDE.md. */
 const RUN_RETENTION_SEC = 7 * 86_400;
 
+/**
+ * D1 caps bound parameters per query. We stay well under the documented 100 so
+ * that adding a column later cannot silently push a statement over the edge.
+ */
+const MAX_BOUND_PARAMS = 80;
+
+/**
+ * Collapse many single-row inserts into few multi-row inserts.
+ *
+ * This is a CPU optimisation, not a write-count one — D1 bills rows written, so
+ * the cost to the free tier is identical either way. But each prepared statement
+ * costs roughly 0.1ms of CPU to bind, and the Workers free plan allows 10ms per
+ * invocation. Measured: 48 single-row statements ran at 7ms; the same data as
+ * multi-row inserts runs at a fraction of that.
+ *
+ * Ordering within the batch is preserved, which matters because the dedup-state
+ * write must land in the same transaction as the rows it describes.
+ */
+function chunkedInserts(
+  db: D1Database,
+  table: string,
+  columns: string[],
+  rows: unknown[][],
+): D1PreparedStatement[] {
+  if (rows.length === 0) return [];
+
+  const perStatement = Math.max(1, Math.floor(MAX_BOUND_PARAMS / columns.length));
+  const tuple = `(${columns.map(() => '?').join(', ')})`;
+  const statements: D1PreparedStatement[] = [];
+
+  for (let i = 0; i < rows.length; i += perStatement) {
+    const slice = rows.slice(i, i + perStatement);
+    const sql = `INSERT INTO ${table} (${columns.join(', ')}) VALUES ${slice.map(() => tuple).join(', ')}`;
+    statements.push(db.prepare(sql).bind(...slice.flat()));
+  }
+  return statements;
+}
+
+const PREDICTION_COLUMNS = [
+  'observed_at',
+  'service_date',
+  'trip_id',
+  'stop_sequence',
+  'route_id',
+  'direction_id',
+  'stop_id',
+  'predicted_arrival',
+  'predicted_departure',
+  'horizon_sec',
+  'schedule_relationship',
+  'status',
+  'revision',
+  'vehicle_id',
+  'vehicle_status',
+  'vehicle_stop_sequence',
+  'scheduled_arrival',
+];
+
+const VEHICLE_COLUMNS = [
+  'observed_at',
+  'vehicle_updated_at',
+  'service_date',
+  'vehicle_id',
+  'trip_id',
+  'route_id',
+  'direction_id',
+  'current_status',
+  'current_stop_sequence',
+  'stop_id',
+];
+
+const ALERT_COLUMNS = [
+  'observed_at',
+  'service_date',
+  'alert_id',
+  'mbta_updated_at',
+  'effect',
+  'cause',
+  'severity',
+  'lifecycle',
+  'header',
+  'active_period_start',
+  'active_period_end',
+  'active_periods_json',
+  'affected_routes',
+  'affected_stops',
+  'affects_watched',
+];
+
 export async function runTick(env: Env, startedAtMs: number): Promise<RunRecord> {
   const observedAt = Math.floor(startedAtMs / 1000);
   const run: RunRecord = {
@@ -71,6 +174,9 @@ export async function runTick(env: Env, startedAtMs: number): Promise<RunRecord>
     vehicle_rows_written: 0,
     api_status: null,
     error: null,
+    per_slice_counts: {},
+    alerts_seen: 0,
+    alert_rows_written: 0,
   };
 
   try {
@@ -87,10 +193,10 @@ export async function runTick(env: Env, startedAtMs: number): Promise<RunRecord>
 
     const client = new MbtaClient(env.MBTA_API_KEY);
 
-    // Both feeds must come from the same tick: the vehicle state we attach to a
-    // prediction is meant to describe where the train was when that prediction
-    // was made.
-    const [predictionDoc, vehicleDoc] = await Promise.all([
+    // The prediction and vehicle feeds must come from the same tick: the vehicle
+    // state we attach to a prediction is meant to describe where the train was
+    // when that prediction was made.
+    const [predictionDoc, vehicleDoc, alertDoc] = await Promise.all([
       client.get('/predictions', {
         'filter[stop]': stopIds.join(','),
         'filter[route]': routeIds.join(','),
@@ -102,6 +208,14 @@ export async function runTick(env: Env, startedAtMs: number): Promise<RunRecord>
         'filter[route]': routeIds.join(','),
         include: 'stop',
       }),
+      // Alerts are fetched in parallel but their failure is NON-FATAL. Predictions
+      // are the unrecoverable data; losing a tick of them because the alerts
+      // endpoint was slow would be a bad trade. An alert we miss now is still
+      // described by its own active_period when we next see it.
+      client.get('/alerts', { 'filter[route]': routeIds.join(',') }).catch((err: unknown) => {
+        console.error('alerts fetch failed (non-fatal)', err);
+        return null;
+      }),
     ]);
     run.api_status = 200;
 
@@ -111,7 +225,6 @@ export async function runTick(env: Env, startedAtMs: number): Promise<RunRecord>
     const statements: D1PreparedStatement[] = [];
 
     const predictions = collectPredictions(
-      env.DB,
       predictionDoc,
       vehicleDoc,
       parents,
@@ -120,13 +233,25 @@ export async function runTick(env: Env, startedAtMs: number): Promise<RunRecord>
       observedAt,
     );
     run.predictions_seen = predictions.seen;
-    run.snapshots_written = predictions.statements.length;
-    statements.push(...predictions.statements);
+    run.snapshots_written = predictions.rows.length;
+    run.per_slice_counts = predictions.perSlice;
+    statements.push(
+      ...chunkedInserts(env.DB, 'prediction_snapshots', PREDICTION_COLUMNS, predictions.rows),
+    );
 
-    const vehicles = collectVehicles(env.DB, vehicleDoc, parents, slices, state, observedAt);
+    const vehicles = collectVehicles(vehicleDoc, parents, slices, state, observedAt);
     run.vehicles_seen = vehicles.seen;
-    run.vehicle_rows_written = vehicles.statements.length;
-    statements.push(...vehicles.statements);
+    run.vehicle_rows_written = vehicles.rows.length;
+    statements.push(
+      ...chunkedInserts(env.DB, 'vehicle_observations', VEHICLE_COLUMNS, vehicles.rows),
+    );
+
+    if (alertDoc) {
+      const alerts = collectAlerts(alertDoc, watched, slices, state, observedAt);
+      run.alerts_seen = alerts.seen;
+      run.alert_rows_written = alerts.rows.length;
+      statements.push(...chunkedInserts(env.DB, 'alert_snapshots', ALERT_COLUMNS, alerts.rows));
+    }
 
     pruneState(state, observedAt);
     statements.push(saveStatement(env.DB, state, observedAt));
@@ -160,8 +285,8 @@ async function finish(env: Env, run: RunRecord, startedAtMs: number): Promise<Ru
     await env.DB.prepare(
       `INSERT INTO collector_runs
          (started_at, duration_ms, predictions_seen, snapshots_written,
-          vehicles_seen, vehicle_rows_written, api_status, error)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          vehicles_seen, vehicle_rows_written, api_status, error, per_slice_counts)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
       .bind(
         run.started_at,
@@ -172,6 +297,10 @@ async function finish(env: Env, run: RunRecord, startedAtMs: number): Promise<Ru
         run.vehicle_rows_written,
         run.api_status,
         run.error,
+        // NULL rather than '{}' when the tick failed before counting anything, so
+        // "we counted zero everywhere" stays distinguishable from "we never got
+        // far enough to count".
+        Object.keys(run.per_slice_counts).length ? JSON.stringify(run.per_slice_counts) : null,
       )
       .run();
   } catch (err) {
@@ -191,26 +320,24 @@ async function loadWatchedStops(db: D1Database): Promise<WatchedStop[]> {
 // --- predictions ------------------------------------------------------------
 
 function collectPredictions(
-  db: D1Database,
   doc: Document,
   vehicleDoc: Document,
   parents: Map<string, string>,
   slices: Set<string>,
   state: DedupState,
   observedAt: number,
-): { seen: number; statements: D1PreparedStatement[] } {
+): { seen: number; rows: unknown[][]; perSlice: Record<string, number> } {
   const schedules = indexIncluded(doc, 'schedule');
   const vehicles = new Map(vehicleDoc.data.map((v) => [v.id, v]));
 
-  const insert = db.prepare(
-    `INSERT INTO prediction_snapshots
-       (observed_at, service_date, trip_id, stop_sequence, route_id, direction_id, stop_id,
-        predicted_arrival, predicted_departure, horizon_sec, schedule_relationship, status,
-        revision, vehicle_id, vehicle_status, vehicle_stop_sequence, scheduled_arrival)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  );
+  // Seeded with every watched slice at zero, before looking at the feed. A slice
+  // that returns nothing must appear as an explicit 0 rather than be absent —
+  // an absent key is ambiguous between "no service" and "not watched".
+  const perSlice: Record<string, number> = {};
+  for (const slice of slices) perSlice[slice] = 0;
 
-  const statements: D1PreparedStatement[] = [];
+  const rows: unknown[][] = [];
+  const sd = serviceDate(observedAt);
   let seen = 0;
 
   for (const p of doc.data) {
@@ -226,8 +353,10 @@ function collectPredictions(
 
     const stopId = parents.get(rawStopId) ?? rawStopId;
     const directionId = attrNumber(p, 'direction_id');
-    if (!slices.has(`${stopId}|${routeId}|${directionId}`)) continue;
+    const slice = `${stopId}|${routeId}|${directionId}`;
+    if (!slices.has(slice)) continue;
     seen++;
+    perSlice[slice] = (perSlice[slice] ?? 0) + 1;
 
     const predictedArrival = epochSec(attrString(p, 'arrival_time'));
     const predictedDeparture = epochSec(attrString(p, 'departure_time'));
@@ -258,52 +387,43 @@ function collectPredictions(
     const vehicle = vehicles.get(relId(p, 'vehicle') ?? '') ?? null;
     const schedule = schedules.get(relId(p, 'schedule') ?? '') ?? null;
 
-    statements.push(
-      insert.bind(
-        observedAt,
-        serviceDate(observedAt),
-        tripId,
-        stopSequence,
-        routeId,
-        directionId,
-        stopId,
-        predictedArrival,
-        predictedDeparture,
-        // Signed on purpose. Negative means the promised time has already passed
-        // and MBTA is still showing the prediction — real, and worth keeping.
-        predictedArrival === null ? null : predictedArrival - observedAt,
-        scheduleRelationship,
-        status,
-        revision,
-        vehicle?.id ?? null,
-        vehicle ? attrString(vehicle, 'current_status') : null,
-        vehicle ? attrNumber(vehicle, 'current_stop_sequence') : null,
-        schedule ? epochSec(attrString(schedule, 'arrival_time')) : null,
-      ),
-    );
+    rows.push([
+      observedAt,
+      sd,
+      tripId,
+      stopSequence,
+      routeId,
+      directionId,
+      stopId,
+      predictedArrival,
+      predictedDeparture,
+      // Signed on purpose. Negative means the promised time has already passed
+      // and MBTA is still showing the prediction — real, and worth keeping.
+      predictedArrival === null ? null : predictedArrival - observedAt,
+      scheduleRelationship,
+      status,
+      revision,
+      vehicle?.id ?? null,
+      vehicle ? attrString(vehicle, 'current_status') : null,
+      vehicle ? attrNumber(vehicle, 'current_stop_sequence') : null,
+      schedule ? epochSec(attrString(schedule, 'arrival_time')) : null,
+    ]);
   }
 
-  return { seen, statements };
+  return { seen, rows, perSlice };
 }
 
 // --- vehicles ---------------------------------------------------------------
 
 function collectVehicles(
-  db: D1Database,
   doc: Document,
   parents: Map<string, string>,
   slices: Set<string>,
   state: DedupState,
   observedAt: number,
-): { seen: number; statements: D1PreparedStatement[] } {
-  const insert = db.prepare(
-    `INSERT INTO vehicle_observations
-       (observed_at, vehicle_updated_at, service_date, vehicle_id, trip_id, route_id,
-        direction_id, current_status, current_stop_sequence, stop_id)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  );
-
-  const statements: D1PreparedStatement[] = [];
+): { seen: number; rows: unknown[][] } {
+  const rows: unknown[][] = [];
+  const sd = serviceDate(observedAt);
   let seen = 0;
 
   for (const v of doc.data) {
@@ -344,25 +464,162 @@ function collectVehicles(
     }
     state.h[v.id] = [fingerprint, observedAt, newLinger];
 
-    statements.push(
-      insert.bind(
-        observedAt,
-        // MBTA's own timestamp for the state change, not our poll time. This is
-        // what keeps arrival accuracy tighter than our 60-second resolution.
-        updatedAt,
-        serviceDate(observedAt),
-        v.id,
-        relId(v, 'trip'),
-        routeId,
-        directionId,
-        currentStatus,
-        attrNumber(v, 'current_stop_sequence'),
-        stopId,
-      ),
-    );
+    rows.push([
+      observedAt,
+      // MBTA's own timestamp for the state change, not our poll time. This is
+      // what keeps arrival accuracy tighter than our 60-second resolution.
+      updatedAt,
+      sd,
+      v.id,
+      relId(v, 'trip'),
+      routeId,
+      directionId,
+      currentStatus,
+      attrNumber(v, 'current_stop_sequence'),
+      stopId,
+    ]);
   }
 
-  return { seen, statements };
+  return { seen, rows };
+}
+
+// --- alerts -----------------------------------------------------------------
+
+interface InformedEntity {
+  route?: string;
+  stop?: string;
+  direction_id?: number;
+}
+
+interface ActivePeriod {
+  start?: string | null;
+  end?: string | null;
+}
+
+/**
+ * Alerts are what turn a zero-prediction period from "the collector broke" into
+ * "the line was suspended, here is the notice". Deduplicated on content, so a
+ * standing alert costs one row, not one row per minute.
+ */
+function collectAlerts(
+  doc: Document,
+  watched: WatchedStop[],
+  slices: Set<string>,
+  state: DedupState,
+  observedAt: number,
+): { seen: number; rows: unknown[][] } {
+  const watchedRoutes = new Set(watched.map((w) => w.route_id));
+  const watchedStops = new Set(watched.map((w) => w.stop_id));
+
+  const rows: unknown[][] = [];
+  const sd = serviceDate(observedAt);
+
+  for (const a of doc.data) {
+    const entities = attrArray<InformedEntity>(a, 'informed_entity');
+    const periods = attrArray<ActivePeriod>(a, 'active_period');
+    const { start, end } = selectPeriod(periods, observedAt);
+
+    const lifecycle = attrString(a, 'lifecycle');
+    const affectsWatched = alertAffectsWatched(entities, slices, watchedRoutes, watchedStops);
+    const mbtaUpdatedAt = epochSec(attrString(a, 'updated_at'));
+
+    // MBTA's own updated_at is the change signal. The selected period and
+    // lifecycle are included because both can change with the passage of time
+    // while updated_at stays put — an UPCOMING alert becoming ONGOING is a real
+    // transition and should produce a row.
+    const fingerprint = [mbtaUpdatedAt, start, end, lifecycle, affectsWatched ? 1 : 0].join('|');
+
+    const previous = state.a[a.id];
+    if (previous && previous[0] === fingerprint) {
+      previous[1] = observedAt;
+      continue;
+    }
+    state.a[a.id] = [fingerprint, observedAt];
+
+    const routes = unique(entities.map((e) => e.route).filter((r): r is string => !!r));
+    const stops = unique(entities.map((e) => e.stop).filter((s): s is string => !!s));
+
+    rows.push([
+      observedAt,
+      sd,
+      a.id,
+      mbtaUpdatedAt,
+      attrString(a, 'effect'),
+      attrString(a, 'cause'),
+      attrNumber(a, 'severity'),
+      lifecycle,
+      attrString(a, 'header'),
+      start,
+      end,
+      JSON.stringify(periods),
+      JSON.stringify(routes),
+      JSON.stringify(stops),
+      affectsWatched ? 1 : 0,
+    ]);
+  }
+
+  return { seen: doc.data.length, rows };
+}
+
+/**
+ * The period covering now; failing that the next one to start; failing that the
+ * most recent one to have ended. An alert always gets a period recorded, so a
+ * row is never left without a time context.
+ */
+function selectPeriod(
+  periods: ActivePeriod[],
+  observedAt: number,
+): { start: number | null; end: number | null } {
+  let upcoming: { start: number; end: number | null } | null = null;
+  let past: { start: number; end: number | null } | null = null;
+
+  for (const p of periods) {
+    const start = epochSec(p.start ?? null);
+    const end = epochSec(p.end ?? null);
+    if (start === null) continue;
+    // end === null means open-ended, which counts as still covering us.
+    if (start <= observedAt && (end === null || end >= observedAt)) return { start, end };
+    if (start > observedAt) {
+      if (!upcoming || start < upcoming.start) upcoming = { start, end };
+    } else if (!past || start > past.start) {
+      past = { start, end };
+    }
+  }
+  return upcoming ?? past ?? { start: null, end: null };
+}
+
+/**
+ * Whether an alert touches anything we watch.
+ *
+ * informed_entity is progressively specific: a whole-route alert names only a
+ * route, a station closure names a stop, and a directional diversion names
+ * route + stop + direction. Each shape needs its own test — treating a missing
+ * field as a non-match would silently miss line-wide suspensions, which are
+ * exactly the ones that produce zero-prediction periods.
+ */
+function alertAffectsWatched(
+  entities: InformedEntity[],
+  slices: Set<string>,
+  watchedRoutes: Set<string>,
+  watchedStops: Set<string>,
+): boolean {
+  for (const e of entities) {
+    const { route, stop } = e;
+    const direction = typeof e.direction_id === 'number' ? e.direction_id : null;
+
+    if (route && stop) {
+      if (direction === null) {
+        if (slices.has(`${stop}|${route}|0`) || slices.has(`${stop}|${route}|1`)) return true;
+      } else if (slices.has(`${stop}|${route}|${direction}`)) {
+        return true;
+      }
+    } else if (stop) {
+      if (watchedStops.has(stop)) return true;
+    } else if (route) {
+      if (watchedRoutes.has(route)) return true;
+    }
+  }
+  return false;
 }
 
 // --- helpers ----------------------------------------------------------------
@@ -376,4 +633,13 @@ function unique(values: string[]): string[] {
   return [...new Set(values)];
 }
 
-export const __test = { collectPredictions, collectVehicles, shouldPrune };
+export const __test = {
+  chunkedInserts,
+  PREDICTION_COLUMNS,
+  collectPredictions,
+  collectVehicles,
+  collectAlerts,
+  selectPeriod,
+  alertAffectsWatched,
+  shouldPrune,
+};

@@ -10,8 +10,8 @@ crons = ["* * * * *"]
 [[d1_databases]]
 binding = "DB"
 database_name = "mbta"
-# Filled in by: wrangler d1 create mbta
-database_id = "REPLACE_ME"
+# Created by: wrangler d1 create mbta  (region ENAM)
+database_id = "dca8dab5-d1c1-4f94-a8b0-b6ebb42ee562"
 
 [observability]
 enabled = true

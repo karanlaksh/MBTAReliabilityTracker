@@ -73,6 +73,12 @@ export function attrNumber(r: Resource, name: string): number | null {
   return typeof v === 'number' ? v : null;
 }
 
+/** Structured attributes (alert `active_period`, `informed_entity`). */
+export function attrArray<T = Record<string, unknown>>(r: Resource, name: string): T[] {
+  const v = r.attributes?.[name];
+  return Array.isArray(v) ? (v as T[]) : [];
+}
+
 /** ISO 8601 (with offset, as MBTA sends) -> unix epoch seconds. */
 export function epochSec(isoTime: string | null): number | null {
   if (!isoTime) return null;

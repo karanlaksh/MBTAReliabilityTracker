@@ -8,18 +8,8 @@ const { collectPredictions, collectVehicles } = __test;
 const at = (iso: string) => Math.floor(Date.parse(iso) / 1000);
 const T0 = at('2026-08-01T12:00:00-04:00');
 
-/**
- * D1 stand-in. collectPredictions/collectVehicles only ever prepare a statement
- * and bind it, so the bound argument list is exactly what would hit the database.
- */
-interface BoundStatement {
-  args: unknown[];
-}
-const fakeDb = {
-  prepare: () => ({ bind: (...args: unknown[]) => ({ args }) as BoundStatement }),
-} as unknown as D1Database;
-
-const argsOf = (s: unknown) => (s as BoundStatement).args;
+/** Rows are plain value arrays in column order — no statement to unpack. */
+const argsOf = (r: unknown) => r as unknown[];
 
 // Column order matches the INSERT in collector.ts.
 const P = {
@@ -119,10 +109,10 @@ const runPredictions = (
   state: DedupState,
   now: number,
   included: Resource[] = [],
-) => collectPredictions(fakeDb, doc(preds, included), doc(vehicles), PARENTS, SLICES, state, now);
+) => collectPredictions(doc(preds, included), doc(vehicles), PARENTS, SLICES, state, now);
 
 const runVehicles = (vehicles: Resource[], state: DedupState, now: number) =>
-  collectVehicles(fakeDb, doc(vehicles), PARENTS, SLICES, state, now);
+  collectVehicles(doc(vehicles), PARENTS, SLICES, state, now);
 
 describe('collectPredictions', () => {
   let state: DedupState;
@@ -131,8 +121,8 @@ describe('collectPredictions', () => {
   });
 
   it('normalises a platform stop id to its parent station', () => {
-    const { statements } = runPredictions([prediction({})], [], state, T0);
-    expect(argsOf(statements[0])[P.stopId]).toBe('place-rugg');
+    const { rows } = runPredictions([prediction({})], [], state, T0);
+    expect(argsOf(rows[0])[P.stopId]).toBe('place-rugg');
   });
 
   it('ignores predictions outside the watched slices', () => {
@@ -141,21 +131,21 @@ describe('collectPredictions', () => {
       prediction({ trip: 'b', route: 'Red' }), // unwatched route
       prediction({ trip: 'c', stop: '70279' }), // unwatched stop
     ];
-    const { seen, statements } = runPredictions(other, [], state, T0);
+    const { seen, rows } = runPredictions(other, [], state, T0);
     expect(seen).toBe(0);
-    expect(statements).toHaveLength(0);
+    expect(rows).toHaveLength(0);
   });
 
   it('skips predictions missing part of the natural key', () => {
     const broken = prediction({});
     delete broken.attributes!.stop_sequence;
-    expect(runPredictions([broken], [], state, T0).statements).toHaveLength(0);
+    expect(runPredictions([broken], [], state, T0).rows).toHaveLength(0);
   });
 
   it('records the first sighting as revision 1', () => {
-    const { statements } = runPredictions([prediction({})], [], state, T0);
-    expect(statements).toHaveLength(1);
-    const a = argsOf(statements[0]);
+    const { rows } = runPredictions([prediction({})], [], state, T0);
+    expect(rows).toHaveLength(1);
+    const a = argsOf(rows[0]);
     expect(a[P.revision]).toBe(1);
     expect(a[P.serviceDate]).toBe('2026-08-01');
     expect(a[P.tripId]).toBe('trip1');
@@ -166,18 +156,18 @@ describe('collectPredictions', () => {
     runPredictions([prediction({})], [], state, T0);
     const second = runPredictions([prediction({})], [], state, T0 + 60);
     expect(second.seen).toBe(1);
-    expect(second.statements).toHaveLength(0);
+    expect(second.rows).toHaveLength(0);
   });
 
   it('increments revision when the promised time changes', () => {
     runPredictions([prediction({})], [], state, T0);
-    const { statements } = runPredictions(
+    const { rows } = runPredictions(
       [prediction({ arrival: '2026-08-01T12:07:00-04:00' })],
       [],
       state,
       T0 + 60,
     );
-    expect(argsOf(statements[0])[P.revision]).toBe(2);
+    expect(argsOf(rows[0])[P.revision]).toBe(2);
   });
 
   it('does NOT write a snapshot just because the vehicle moved', () => {
@@ -185,40 +175,40 @@ describe('collectPredictions', () => {
     // including it in the fingerprint would mean writing every prediction every
     // minute and dedup would buy nothing.
     runPredictions([prediction({})], [vehicle({ stopSequence: 130 })], state, T0);
-    const { statements } = runPredictions(
+    const { rows } = runPredictions(
       [prediction({})],
       [vehicle({ stopSequence: 138, status: 'INCOMING_AT' })],
       state,
       T0 + 60,
     );
-    expect(statements).toHaveLength(0);
+    expect(rows).toHaveLength(0);
   });
 
   it('attaches the vehicle state present at the moment it does write', () => {
-    const { statements } = runPredictions(
+    const { rows } = runPredictions(
       [prediction({})],
       [vehicle({ id: 'O-1', stopSequence: 132 })],
       state,
       T0,
     );
-    const a = argsOf(statements[0]);
+    const a = argsOf(rows[0]);
     expect(a[P.vehicleId]).toBe('O-1');
     expect(a[P.vehicleStopSequence]).toBe(132);
   });
 
   it('computes a signed horizon against the observation time', () => {
     const ahead = runPredictions([prediction({})], [], state, T0);
-    expect(argsOf(ahead.statements[0])[P.horizonSec]).toBe(300);
+    expect(argsOf(ahead.rows[0])[P.horizonSec]).toBe(300);
 
     // A prediction whose promised time has already passed keeps a negative
     // horizon rather than being clamped or dropped.
     const late = runPredictions([prediction({ trip: 'trip2' })], [], state, T0 + 420);
-    expect(argsOf(late.statements[0])[P.horizonSec]).toBe(-120);
+    expect(argsOf(late.rows[0])[P.horizonSec]).toBe(-120);
   });
 
   it('tolerates a prediction with no arrival time', () => {
-    const { statements } = runPredictions([prediction({ arrival: null })], [], state, T0);
-    const a = argsOf(statements[0]);
+    const { rows } = runPredictions([prediction({ arrival: null })], [], state, T0);
+    const a = argsOf(rows[0]);
     expect(a[P.predictedArrival]).toBeNull();
     expect(a[P.horizonSec]).toBeNull();
   });
@@ -236,12 +226,12 @@ describe('collectPredictions', () => {
       T0,
       [schedule],
     );
-    expect(argsOf(withSchedule.statements[0])[P.scheduledArrival]).toBe(
+    expect(argsOf(withSchedule.rows[0])[P.scheduledArrival]).toBe(
       at('2026-08-01T12:04:00-04:00'),
     );
 
     const without = runPredictions([prediction({ trip: 'trip9' })], [], state, T0);
-    expect(argsOf(without.statements[0])[P.scheduledArrival]).toBeNull();
+    expect(argsOf(without.rows[0])[P.scheduledArrival]).toBeNull();
   });
 });
 
@@ -252,18 +242,18 @@ describe('collectVehicles', () => {
   });
 
   it('ignores vehicles that are nowhere near a watched stop', () => {
-    const { seen, statements } = runVehicles([vehicle({ stop: '70279' })], state, T0);
+    const { seen, rows } = runVehicles([vehicle({ stop: '70279' })], state, T0);
     expect(seen).toBe(1); // counted, because it is on a watched route
-    expect(statements).toHaveLength(0);
+    expect(rows).toHaveLength(0);
   });
 
   it('records a vehicle approaching a watched stop, using MBTA’s own timestamp', () => {
-    const { statements } = runVehicles(
+    const { rows } = runVehicles(
       [vehicle({ status: 'INCOMING_AT', updatedAt: '2026-08-01T12:00:17-04:00' })],
       state,
       T0,
     );
-    const a = argsOf(statements[0]);
+    const a = argsOf(rows[0]);
     expect(a[V.currentStatus]).toBe('INCOMING_AT');
     expect(a[V.stopId]).toBe('place-rugg');
     // Not our poll time: MBTA timestamps its own state change far more tightly
@@ -274,10 +264,10 @@ describe('collectVehicles', () => {
 
   it('writes one row per state change, not one per poll', () => {
     runVehicles([vehicle({ status: 'IN_TRANSIT_TO' })], state, T0);
-    expect(runVehicles([vehicle({ status: 'IN_TRANSIT_TO' })], state, T0 + 60).statements).toHaveLength(
+    expect(runVehicles([vehicle({ status: 'IN_TRANSIT_TO' })], state, T0 + 60).rows).toHaveLength(
       0,
     );
-    expect(runVehicles([vehicle({ status: 'STOPPED_AT' })], state, T0 + 120).statements).toHaveLength(
+    expect(runVehicles([vehicle({ status: 'STOPPED_AT' })], state, T0 + 120).rows).toHaveLength(
       1,
     );
   });
@@ -292,8 +282,8 @@ describe('collectVehicles', () => {
       state,
       T0 + 60,
     );
-    expect(departed.statements).toHaveLength(1);
-    expect(argsOf(departed.statements[0])[V.currentStopSequence]).toBe(150);
+    expect(departed.rows).toHaveLength(1);
+    expect(argsOf(departed.rows[0])[V.currentStopSequence]).toBe(150);
   });
 
   it('stops recording once the linger window expires', () => {
@@ -303,12 +293,12 @@ describe('collectVehicles', () => {
       state,
       T0 + 301,
     );
-    expect(late.statements).toHaveLength(0);
+    expect(late.rows).toHaveLength(0);
   });
 
   it('skips vehicles with no reported status', () => {
     const v = vehicle({});
     delete v.attributes!.current_status;
-    expect(runVehicles([v], state, T0).statements).toHaveLength(0);
+    expect(runVehicles([v], state, T0).rows).toHaveLength(0);
   });
 });

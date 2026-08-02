@@ -15,8 +15,8 @@ Design rationale lives in [CLAUDE.md](CLAUDE.md). This file covers running it.
 
 | Stage | State |
 |-------|-------|
-| 1. Schema | done — `migrations/0001_init.sql` |
-| 2. Collector (this) | done |
+| 1. Schema | done — `migrations/0001_init.sql`, `0002_alerts_and_stops.sql` |
+| 2. Collector (this) | done, deployed, collecting |
 | 3. Status page | next |
 | 4. Matching logic | not started |
 | 5. Rollups + dashboard | not started |
@@ -27,12 +27,31 @@ Once a minute:
 
 1. `GET /predictions` for the watched stops, with `include=stop,schedule`.
 2. `GET /vehicles` for the watched routes, with `include=stop`.
-3. Appends a `prediction_snapshots` row for every prediction **whose value changed**.
-4. Appends a `vehicle_observations` row for every vehicle state change near a watched stop.
-5. Writes dedup state and a `collector_runs` row.
+3. `GET /alerts` for the watched routes. Failure here is non-fatal.
+4. Appends a `prediction_snapshots` row for every prediction **whose value changed**.
+5. Appends a `vehicle_observations` row for every vehicle state change near a watched stop.
+6. Appends an `alert_snapshots` row for every alert whose content changed.
+7. Writes dedup state and a `collector_runs` row carrying per-slice prediction counts.
 
-Both feeds are fetched in the same tick, so the vehicle state attached to a prediction
-describes where the train actually was when that prediction was made.
+The prediction and vehicle feeds are fetched in the same tick, so the vehicle state
+attached to a prediction describes where the train actually was when that prediction was
+made.
+
+### Watched slices
+
+Ten, seeded across two migrations:
+
+| stop | route | mode | role |
+|------|-------|------|------|
+| Ruggles | Orange (both directions) | subway | mid_line |
+| Massachusetts Ave | Orange (both directions) | subway | mid_line |
+| Forest Hills | Orange (both directions) | subway | terminus |
+| Northeastern University | Green-E (both directions) | subway | mid_line |
+| Huntington Ave @ Opera Pl (`41391`) | 39 outbound | bus | mid_line |
+| 360 Huntington Ave (`81317`) | 39 inbound | bus | mid_line |
+
+Adding a slice is an `INSERT INTO watched_stops` with no redeploy — the watched set is
+config in the database, not in code.
 
 ## Setup
 
@@ -73,33 +92,52 @@ Free from https://api-v3.mbta.com/register.
 Numbers below are from live ticks against the real API on 2026-08-01, at low-service hours
 (~00:20 local) with the four seeded slices.
 
-| Metric | Observed |
-|--------|---------:|
-| Predictions per tick at watched stops | 31–32 |
-| Snapshots written per tick after dedup | 24–28 |
-| Vehicles on watched routes | 26 |
-| Vehicle rows written per tick | 0–4 |
-| Tick duration | 185–470 ms |
-| Gap between MBTA's `updated_at` and our poll | 4–33 s |
+| Metric | 4 slices | 10 slices |
+|--------|---------:|----------:|
+| Predictions per tick at watched stops | 17–18 | 61–66 |
+| Snapshots written per tick after dedup | 11–13 | 43–55 |
+| Vehicle rows written per tick | 0–4 | 3–7 |
+| Alerts seen / written per tick | — | 7 / 0 after the first |
+| CPU per invocation (10 ms cap) | 3–4 ms | see below |
+| Wall time per invocation | 1.3–2.3 s | 1.3–2.5 s |
+| Gap between MBTA's `updated_at` and our poll | 4–33 s | 4–33 s |
+
+Green-E contributes 0 of the 10-slice numbers above — it is suspended (see below), so
+expect roughly 14 more predictions per tick once it returns.
+
+### The write budget is the binding constraint
 
 **Dedup is much weaker than the write budget in CLAUDE.md assumes**, and this is a property
 of the feed rather than a bug. Two polls 20 seconds apart showed 21 of 30 shared
 predictions changed, almost all by 1–5 seconds. MBTA re-estimates continuously, so most
 predictions genuinely differ on every tick.
 
-Extrapolated daily writes: ~48,000 snapshots (assuming ~40/tick averaged over ~20 service
-hours), ~4,000 vehicle rows, and 1,440 each for state, runs, and the daily prune —
-**roughly 56,000 of the 100,000/day free-tier limit.**
+Measured over 60 consecutive production ticks (Saturday evening, Green-E suspended):
+**50.9 snapshots written per tick on average**, peak 63.
 
-That fits, but headroom is ~1.7×, so there is room for perhaps 2–3 more slices — not the
-6–8 stops CLAUDE.md estimates. Measure a full weekday in the Cloudflare dashboard
-(D1 > Metrics > Row Metrics) before adding any.
+| Source | Writes/day |
+|--------|-----------:|
+| prediction_snapshots | ~70,000–85,000 |
+| vehicle_observations | ~5,000 |
+| collector_state | 1,440 |
+| collector_runs | 1,440 |
+| daily prune of collector_runs | 1,440 |
+| alert_snapshots | ~100 |
+| **Total** | **~80,000–95,000** |
 
-If it ever needs to come down, the cheapest lever is a jitter tolerance: treat a
-predicted-arrival change smaller than N seconds as no change. A 1-second revision is model
-noise, not new information, and the signal being measured is 30–300 seconds wide. That is
-deliberately *not* implemented, because it changes what a `revision` means and that is a
-data-semantics decision worth making on real data.
+Against a **100,000/day** hard limit. The range accounts for overnight lulls, rush-hour
+peaks, and roughly +14 predictions/tick when Green-E returns. **This is tight, and it is
+the thing to watch first** in the Cloudflare dashboard under D1 > Metrics > Row Metrics.
+
+The lever, if it needs to come down: a **jitter tolerance** — treat a predicted-arrival
+change smaller than N seconds as no change. Measured against real collected data, ignoring
+changes under 10s would suppress ~62% of revisions, and under 15s ~68%. That is a 2–3x
+reduction in the dominant write source.
+
+It is deliberately **not implemented**. A 1-second revision is model noise rather than new
+information, and the signal being measured is 30–300 seconds wide, so the cost to accuracy
+is small — but it changes what `revision` means and slightly stales the stored prediction,
+and that is a data-semantics decision worth making deliberately rather than by default.
 
 ## Design decisions in this code
 
@@ -130,24 +168,73 @@ together or not at all, so state can never claim we recorded something we did no
 **A `collector_runs` row is written even when the tick fails.** A failed tick that left no
 trace is indistinguishable from one that never fired.
 
+**Alerts are captured, and their failure is non-fatal.** A suspended line returns zero
+predictions, which looks exactly like a broken collector. `alert_snapshots` plus
+`collector_runs.per_slice_counts` (which records an explicit `0` for every watched slice)
+together make a gap self-explanatory. The alerts fetch is wrapped so that an alerts outage
+cannot cost a tick of predictions, which are the unrecoverable half.
+
+**Whether an alert applied to a prediction is derived at rollup time, not stored.** Same
+principle as prediction error: `alert_snapshots` carries the active period and the affected
+routes/stops, and the join happens later. `affects_watched` is the one exception — a
+precomputed flag, because it needs the watched set that the rollup would otherwise re-derive.
+
+**Rows are batched into multi-row inserts.** Not for write cost — D1 bills rows, so it is
+identical — but for CPU. Each prepared statement costs measurable CPU to bind, and the free
+plan is CPU-limited per invocation. See the CPU section below.
+
+**Prediction-snapshot writes go out as ~13 statements instead of ~50.** `MAX_BOUND_PARAMS`
+is held at 80 rather than D1's documented 100 so that adding a column later cannot silently
+push a statement over the limit.
+
 ## Tests
 
 ```bash
-npm test        # 24 tests
+npm test        # 49 tests
 npm run typecheck
 ```
 
-Coverage is concentrated on the two things that fail silently: the 03:00 service-date
-rollover (including both DST transitions and the ambiguous 01:30 that happens twice in
-November), and the dedup rules that the write budget depends on.
+Coverage is concentrated on what fails silently rather than loudly:
+
+- the 03:00 service-date rollover, including both DST transitions and the ambiguous 01:30
+  that happens twice in November
+- the dedup rules the write budget depends on
+- multi-row insert chunking — parameter ceiling, ordering across chunk seams, column
+  alignment — because a bug there corrupts data without throwing
+- alert period selection and the `affects_watched` matching rules, including the line-wide
+  alert that names a route but no stop
 
 ## Layout
 
 ```
-migrations/0001_init.sql   schema + seeded watched stops
-src/index.ts               cron entrypoint, /health, /collect
-src/collector.ts           one tick: fetch, filter, dedup, write
-src/mbta.ts                V3 API client and JSON:API helpers
-src/service-date.ts        the 03:00 rollover
-src/state.ts               dedup state as one JSON row
+migrations/0001_init.sql              schema + first four watched stops
+migrations/0002_alerts_and_stops.sql  alerts, per-slice counts, six more slices
+src/index.ts                          cron entrypoint, /health, /collect
+src/collector.ts                      one tick: fetch, filter, dedup, write
+src/mbta.ts                           V3 API client and JSON:API helpers
+src/service-date.ts                   the 03:00 rollover
+src/state.ts                          dedup state as one JSON row
 ```
+
+## CPU, and a correction to the assumed limit
+
+The Workers free plan is documented at **10 ms CPU per invocation**, and a cron trigger has
+no automatic retry — an invocation killed for exceeding CPU is a permanently lost tick.
+
+Measured across 57 consecutive production invocations at 10 slices: **median 6 ms, max
+11 ms**, zero non-`ok` outcomes.
+
+The 11 ms sample matters: it **completed successfully**. So whatever limit applies to this
+cron worker, it is not a hard 10 ms kill. That is worth knowing but not worth relying on —
+treat 10 ms as the working budget.
+
+Where the CPU actually goes is only partly understood. Batching statements dropped the
+median from 7 ms to 6 ms — a real improvement, but far less than the ~3 ms predicted from
+the statement-count difference, so per-statement binding is *not* the dominant cost. The
+remainder is isolate startup, three JSON payload parses (~105 KB combined), and binding
+overhead, and has not been profiled further.
+
+One thing that is understood, and worth not breaking: `Intl.DateTimeFormat` costs ~9 ms to
+construct — more than the entire budget — and `serviceDate()` runs once per prediction row.
+It is hoisted to module scope in `src/service-date.ts` so it is paid once per isolate. Do
+not move it inside the function.

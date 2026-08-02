@@ -26,6 +26,8 @@ const STATE_VERSION = 1;
 export type PredictionEntry = [string, number, number];
 /** [fingerprint, lastSeenAt, lingerUntil] */
 export type VehicleEntry = [string, number, number];
+/** [fingerprint, lastSeenAt] */
+export type AlertEntry = [string, number];
 
 export interface DedupState {
   v: number;
@@ -35,10 +37,17 @@ export interface DedupState {
   p: Record<string, PredictionEntry>;
   /** '<vehicle_id>' -> entry */
   h: Record<string, VehicleEntry>;
+  /**
+   * '<alert_id>' -> entry. Added after v1 without bumping STATE_VERSION: the
+   * field is purely additive, so an existing row parses fine and defaults to
+   * empty. Bumping the version would have discarded live prediction revision
+   * counters for no benefit.
+   */
+  a: Record<string, AlertEntry>;
 }
 
 export function emptyState(serviceDate: string): DedupState {
-  return { v: STATE_VERSION, d: serviceDate, p: {}, h: {} };
+  return { v: STATE_VERSION, d: serviceDate, p: {}, h: {}, a: {} };
 }
 
 export async function loadState(db: D1Database, serviceDate: string): Promise<DedupState> {
@@ -65,6 +74,7 @@ export async function loadState(db: D1Database, serviceDate: string): Promise<De
   }
   parsed.p ??= {};
   parsed.h ??= {};
+  parsed.a ??= {};
   return parsed;
 }
 
@@ -76,6 +86,9 @@ export function pruneState(state: DedupState, now: number): void {
   }
   for (const [key, entry] of Object.entries(state.h)) {
     if (entry[1] < cutoff) delete state.h[key];
+  }
+  for (const [key, entry] of Object.entries(state.a)) {
+    if (entry[1] < cutoff) delete state.a[key];
   }
 }
 
