@@ -151,6 +151,31 @@ interface WatchedStop {
  */
 const VEHICLE_LINGER_SEC = 300;
 
+/**
+ * Record a vehicle when its current_stop_sequence is within this many stops of a
+ * target it holds a prediction for, even if its current stop is not itself a
+ * watched stop.
+ *
+ * Why this exists: the linger rule only fires once a vehicle's *current* stop
+ * equals a watched stop. Bus stops sit ~200m apart and the cron polls every 60s,
+ * so a bus routinely passes a watched stop between polls without ever reporting
+ * it as current — no observation, no linger, no evidence. Measured over 25.6h:
+ * 275 route-39 trips held predictions at a watched stop, but only 180 were ever
+ * observed. 22.8% of settled bus predictions had no arrival evidence at all.
+ *
+ * Why +/-3 specifically, and why it is safe: stop_sequence spacing differs by
+ * mode, measured from live data. Route 39 increments by 1 (…6,7,8,9…), so +/-3 is
+ * three real stops either side — enough to bracket the target. Orange and Green-E
+ * increment by 10 (…130,140,150…), so a +/-3 window around a subway target
+ * contains only the target itself and this rule is a no-op there. The bus fix
+ * therefore costs nothing on the subway.
+ *
+ * Bounded deliberately: recording every observation for every trip holding a
+ * prediction would buy rows the matcher can never join against. Matching needs
+ * evidence bracketing the target, not the whole journey.
+ */
+const NEAR_TARGET_SEQUENCE = 3;
+
 /** collector_runs retention, per CLAUDE.md. */
 const RUN_RETENTION_SEC = 7 * 86_400;
 
@@ -364,7 +389,14 @@ export async function runTick(env: Env, startedAtMs: number): Promise<RunRecord>
       ...chunkedInserts(env.DB, 'prediction_snapshots', PREDICTION_COLUMNS, predictions.rows),
     );
 
-    const vehicles = collectVehicles(vehicleDoc, parents, slices, state, observedAt);
+    const vehicles = collectVehicles(
+      vehicleDoc,
+      parents,
+      slices,
+      state,
+      observedAt,
+      predictions.targetsByTrip,
+    );
     run.vehicles_seen = vehicles.seen;
     run.vehicle_rows_written = vehicles.rows.length;
     statements.push(
@@ -510,6 +542,7 @@ function collectPredictions(
   rows: unknown[][];
   perSlice: Record<string, number>;
   horizonSuppressed: number;
+  targetsByTrip: Map<string, number[]>;
 } {
   const schedules = indexIncluded(doc, 'schedule');
   const vehicles = new Map(vehicleDoc.data.map((v) => [v.id, v]));
@@ -524,6 +557,12 @@ function collectPredictions(
   const sd = serviceDate(observedAt);
   let seen = 0;
   let horizonSuppressed = 0;
+
+  // trip_id -> stop_sequences this trip is predicted to serve at a watched stop.
+  // Built from every prediction we SAW, including ones the horizon cap suppressed
+  // from being written: the vehicle rule below needs to know the target exists,
+  // not whether we chose to store a snapshot of it.
+  const targetsByTrip = new Map<string, number[]>();
 
   for (const p of doc.data) {
     const tripId = relId(p, 'trip');
@@ -542,6 +581,13 @@ function collectPredictions(
     if (!slices.has(slice)) continue;
     seen++;
     perSlice[slice] = (perSlice[slice] ?? 0) + 1;
+
+    const seqs = targetsByTrip.get(tripId);
+    if (seqs) {
+      if (!seqs.includes(stopSequence)) seqs.push(stopSequence);
+    } else {
+      targetsByTrip.set(tripId, [stopSequence]);
+    }
 
     const predictedArrival = epochSec(attrString(p, 'arrival_time'));
     const predictedDeparture = epochSec(attrString(p, 'departure_time'));
@@ -637,7 +683,7 @@ function collectPredictions(
     ]);
   }
 
-  return { seen, rows, perSlice, horizonSuppressed };
+  return { seen, rows, perSlice, horizonSuppressed, targetsByTrip };
 }
 
 // --- vehicles ---------------------------------------------------------------
@@ -648,6 +694,7 @@ function collectVehicles(
   slices: Set<string>,
   state: DedupState,
   observedAt: number,
+  targetsByTrip: Map<string, number[]> = new Map(),
 ): { seen: number; rows: unknown[][] } {
   const rows: unknown[][] = [];
   const sd = serviceDate(observedAt);
@@ -669,9 +716,20 @@ function collectVehicles(
     const atWatchedStop =
       stopId !== null && routeId !== null && slices.has(`${stopId}|${routeId}|${directionId}`);
 
+    // Second, sequence-based rule. Catches the bus case the stop-based rule
+    // misses entirely: a vehicle that passes a watched stop between polls without
+    // ever reporting it as current. See NEAR_TARGET_SEQUENCE.
+    const currentSeq = attrNumber(v, 'current_stop_sequence');
+    const tripId = relId(v, 'trip');
+    const targets = tripId ? targetsByTrip.get(tripId) : undefined;
+    const nearTarget =
+      currentSeq !== null &&
+      targets !== undefined &&
+      targets.some((t) => Math.abs(currentSeq - t) <= NEAR_TARGET_SEQUENCE);
+
     const previous = state.h[v.id];
     const lingerUntil = previous?.[2] ?? 0;
-    if (!atWatchedStop && observedAt >= lingerUntil) {
+    if (!atWatchedStop && !nearTarget && observedAt >= lingerUntil) {
       // Somewhere else on the line. Recording every state change of every train
       // on the Orange and Green-E lines would cost ~86,000 writes/day on its own,
       // and none of it is evidence about our stops.
@@ -683,7 +741,8 @@ function collectVehicles(
       attrNumber(v, 'current_stop_sequence'),
       relId(v, 'trip'),
     ].join('|');
-    const newLinger = atWatchedStop ? observedAt + VEHICLE_LINGER_SEC : lingerUntil;
+    const newLinger =
+      atWatchedStop || nearTarget ? observedAt + VEHICLE_LINGER_SEC : lingerUntil;
 
     if (previous && previous[0] === fingerprint) {
       state.h[v.id] = [fingerprint, observedAt, newLinger];

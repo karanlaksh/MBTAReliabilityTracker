@@ -1,0 +1,31 @@
+-- MBTA Reliability Tracker — migration 0006
+--
+-- A permanent plausibility flag on matched arrivals.
+--
+-- Motivation: the first deployed matcher searched for terminus turnaround
+-- evidence without bounding the time window, and produced 167 arrivals wrong by
+-- more than an hour — the worst by 16 hours. Nothing threw. The run reported no
+-- errors. It was found only by manually checking actual_arrival_at against
+-- predicted_arrival for plausibility, which is exactly the failure mode CLAUDE.md
+-- warns about: every downstream number quietly wrong with nothing raising.
+--
+-- So the check becomes permanent. But it FLAGS, it does not FILTER.
+--
+-- WHY FLAGGING RATHER THAN DROPPING MATTERS: a filter that discarded implausible
+-- matches would preferentially discard the largest errors. The largest errors are
+-- mostly real delays — the exact tail this project exists to measure. Silently
+-- removing them would truncate the distribution and flatter MBTA, producing a
+-- headline number that looks better precisely because the worst outcomes were
+-- deleted. That is the same failure as dropping unfulfilled predictions, in a
+-- different costume.
+--
+-- The threshold is therefore deliberately generous: an hour. A genuine subway
+-- delay of over an hour at a mid-line stop is close to unheard of, so this
+-- catches matcher faults rather than transit events. When a real one occurs it
+-- gets flagged, stays in the data, and stays in every aggregate.
+--
+-- 0 = the matched arrival is within an hour of the last predicted arrival.
+-- 1 = it is not. Investigate the matcher before believing it.
+-- NULL is not used; rows written before this migration keep the 0 default and
+-- are re-flagged on the next backfill.
+ALTER TABLE arrivals ADD COLUMN implausible INTEGER NOT NULL DEFAULT 0;

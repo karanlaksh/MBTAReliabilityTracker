@@ -113,8 +113,12 @@ const runPredictions = (
   included: Resource[] = [],
 ) => collectPredictions(doc(preds, included), doc(vehicles), PARENTS, SLICES, state, now);
 
-const runVehicles = (vehicles: Resource[], state: DedupState, now: number) =>
-  collectVehicles(doc(vehicles), PARENTS, SLICES, state, now);
+const runVehicles = (
+  vehicles: Resource[],
+  state: DedupState,
+  now: number,
+  targetsByTrip: Map<string, number[]> = new Map(),
+) => collectVehicles(doc(vehicles), PARENTS, SLICES, state, now, targetsByTrip);
 
 describe('collectPredictions', () => {
   let state: DedupState;
@@ -492,5 +496,57 @@ describe('first_seen_at / first_predicted_arrival', () => {
     expect(a[P.firstSeenAt]).toBeNull();
     expect(a[P.firstPredictedArrival]).toBeNull();
     expect(a[P.revision]).toBe(8); // revision continuity is unaffected
+  });
+});
+
+describe('near-target sequence rule (the bus fix)', () => {
+  let state: DedupState;
+  beforeEach(() => {
+    state = emptyState('2026-08-01');
+  });
+
+  // Route 39 numbers its stops 1 apart, so a target at seq 6 has real neighbours
+  // at 3,4,5,7,8,9. The vehicle's own stop is NOT a watched stop in these cases —
+  // that is the whole point, since a bus routinely passes ours between polls.
+  const busTargets = new Map([['bus-trip', [6]]]);
+  const bus = (seq: number, status = 'IN_TRANSIT_TO') =>
+    vehicle({ id: 'B-1', trip: 'bus-trip', route: '39', stop: '70279', stopSequence: seq, status });
+
+  it('records a bus approaching within 3 stops of its target', () => {
+    const { rows } = runVehicles([bus(4)], state, T0, busTargets);
+    expect(rows).toHaveLength(1);
+    expect(argsOf(rows[0])[V.currentStopSequence]).toBe(4);
+  });
+
+  it('records it on the far side too, so the target is bracketed', () => {
+    runVehicles([bus(4)], state, T0, busTargets);
+    const after = runVehicles([bus(8)], state, T0 + 60, busTargets);
+    expect(after.rows).toHaveLength(1);
+  });
+
+  it('ignores a bus further away than the window', () => {
+    expect(runVehicles([bus(2)], state, T0, busTargets).rows).toHaveLength(0);
+    expect(runVehicles([bus(10)], state, T0, busTargets).rows).toHaveLength(0);
+  });
+
+  it('is a no-op at subway sequence spacing', () => {
+    // Orange numbers stops 10 apart, so +/-3 around a target of 140 contains only
+    // 140 itself. The neighbouring stop at 130 must not be recorded, or the bus
+    // fix would silently add subway writes.
+    const subwayTargets = new Map([['trip1', [140]]]);
+    const neighbour = vehicle({ stopSequence: 130, stop: '70279' });
+    expect(runVehicles([neighbour], state, T0, subwayTargets).rows).toHaveLength(0);
+  });
+
+  it('ignores a vehicle whose trip holds no prediction at a watched stop', () => {
+    const stranger = vehicle({ id: 'B-9', trip: 'other-trip', route: '39', stop: '70279', stopSequence: 6 });
+    expect(runVehicles([stranger], state, T0, busTargets).rows).toHaveLength(0);
+  });
+
+  it('starts the linger, so evidence continues past the window', () => {
+    runVehicles([bus(6, 'STOPPED_AT')], state, T0, busTargets);
+    // Now 4 stops past the target — outside +/-3, but inside the linger.
+    const past = runVehicles([bus(10)], state, T0 + 60, busTargets);
+    expect(past.rows).toHaveLength(1);
   });
 });

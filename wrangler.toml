@@ -2,10 +2,11 @@ name = "mbta-collector"
 main = "src/index.ts"
 compatibility_date = "2026-07-01"
 
-# Every minute. Data starts accumulating the day this goes live and lost days are
-# not recoverable, so uptime matters more than anything else in this file.
+# Two schedules. The collector must run every minute — predictions are ephemeral
+# and a missed minute is unrecoverable. The matcher only reads already-stored
+# data, so it can run far less often and be re-run freely.
 [triggers]
-crons = ["* * * * *"]
+crons = ["* * * * *", "*/15 * * * *"]
 
 [[d1_databases]]
 binding = "DB"

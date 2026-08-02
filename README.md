@@ -17,8 +17,8 @@ Design rationale lives in [CLAUDE.md](CLAUDE.md). This file covers running it.
 |-------|-------|
 | 1. Schema | done — `migrations/0001*`, `0002*`, `0003*` |
 | 2. Collector (this) | done, deployed, collecting |
-| 3. Status page | next |
-| 4. Matching logic | not started |
+| 3. Status page | next — `/status` already serves what it needs |
+| 4. Matching logic | done, deployed, running on `*/15` |
 | 5. Rollups + dashboard | not started |
 
 ## What the collector does
@@ -104,6 +104,189 @@ Numbers below are from live ticks against the real API on 2026-08-01, at low-ser
 
 Green-E contributes 0 of the 10-slice numbers above — it is suspended (see below), so
 expect roughly 14 more predictions per tick once it returns.
+
+## The matcher (step 4)
+
+Joining a stored prediction to the arrival that fulfilled it. Two record streams,
+no fully trustworthy shared id, timestamps that do not line up, orphans on both sides.
+
+### The grading unit is HORIZON, not revision
+
+A rider sees one prediction: whichever was on screen when they looked. So each
+(trip, stop) contributes exactly **one** data point per horizon bucket — the snapshot with
+the largest `horizon_sec` inside that bucket, i.e. the prediction displayed as the trip
+first entered the band. Buckets are 0-3, 3-6, 6-12, 12-20 minutes.
+
+The alternatives were rejected for specific reasons, recorded here so nobody drifts back:
+
+- **Last prediction** converges to zero error. It measures MBTA at its easiest.
+- **First prediction** is an artefact of our own horizon cap, not of MBTA, and is not
+  comparable across the cap boundary.
+- **Every revision** lets a trip MBTA fidgeted about 40 times outvote a stable trip 40:1.
+  Fidgeting correlates with delay, so that weights the average toward chaotic trips — a
+  sampling artefact of our own making.
+
+Horizon is the horizon MBTA **displayed** (`predicted_arrival - observed_at`), not true
+time remaining. A train running 10 minutes late has its "5 minute" snapshot graded at
++10 minutes. That is what the rider experienced, and it is intended.
+
+### Establishing actual arrival
+
+| source | rule | uncertainty |
+|---|---|---|
+| `stopped_at` | **earliest** `vehicle_updated_at` with `STOPPED_AT` at the target | 30s |
+| `stopped_at_turnaround` | terminus; bracketed between last approach and first reassignment | half the bracket |
+| `sequence_advanced` | never seen stopped; observations bracket the target sequence | half the bracket |
+| `skipped` | `SKIPPED`/`CANCELLED`, or arrival+departure+status all null | n/a |
+| `unresolved_dropout` | predictions existed, then vanished, no evidence | n/a |
+| `no_arrival_predicted` | MBTA published a departure but never an arrival | n/a |
+
+**Earliest, not latest.** A vehicle reports `STOPPED_AT` for its whole dwell. Taking the
+last would push arrival to the end of the dwell, which at Forest Hills is several minutes
+of manufactured lateness.
+
+**Uncertainty is computed, never assumed.** Every bracketed source reports half its own
+bracket width, so a wide bracket honestly declares itself imprecise.
+
+**Joins prefer `stop_sequence` over `stop_id`**, because `stop_id` is the mutable field.
+`arrivals.match_key` records which was used. Measured: they agreed on 596 of 596 cases, so
+the preference is currently insurance rather than a fix for an observed fault.
+
+### The terminus turnaround
+
+Measured before designing: Forest Hills dir 0 has **zero** `STOPPED_AT` observations across
+169 settled arrivals. Not missing data — on arrival MBTA immediately reassigns the vehicle
+to its next outbound trip, so the stop event is filed under a **different trip_id** at
+direction 1, sequence 1. Linking on `trip_id` can never find it. Bridging on `vehicle_id`
+recovers 166 of 169.
+
+It is **bracketed, not point-estimated**. The reassignment timestamp is at or after physical
+arrival — a one-directional lag, not symmetric noise — so using it directly would bias every
+terminus arrival late and read as MBTA under-predicting at Forest Hills. A finding
+manufactured entirely by our own method.
+
+Measured reassignment lag (T2−T1) over 212 bracketed cases:
+
+| min | p25 | median | p75 | p90 | max |
+|---:|---:|---:|---:|---:|---:|
+| 14s | 53s | **64s** | 66s | 109s | 312s |
+
+Worth reading carefully: the median of 64s is essentially our own **60-second poll
+interval**. T1 is our last observation, not the true moment of arrival, so this distribution
+is dominated by our polling resolution rather than by MBTA's reassignment lag. The real lag
+is smaller than we can resolve, and the bracket is honest about that.
+
+9 of 221 cases had no approach sighting to bracket against and fall back to the
+reassignment timestamp with a deliberately inflated 300s uncertainty.
+
+### Unfulfilled predictions are never dropped
+
+`skipped` and `unresolved_dropout` stay in the denominator and are reported as a separate
+rate. A median that quietly excludes the trains that never came is systematically
+optimistic, in exactly the cases that matter most.
+
+`no_arrival_predicted` is reported **beside** that rate, not inside it. 302 of 1,366
+prediction-stops are departure-only — MBTA never promised an arrival, so there was nothing
+to fulfil. Counting them as unfulfilled would inflate the rate by ~22 points with cases that
+are not failures.
+
+**Departure grading is SCOPED OUT, not unmeasurable.** MBTA does predict departures at
+origin termini, `predicted_departure` is stored for all of them, and grading those against
+actual departure is a real capability being deliberately deferred — it needs different
+detection machinery than arrival does.
+
+### Plausibility: flagged, never filtered
+
+`arrivals.implausible` marks a match more than an hour from the last predicted arrival.
+Surfaced on `/status`; the rows stay, and stay in every aggregate.
+
+The threshold is generous on purpose. A filter that discarded implausible matches would
+preferentially discard the **largest errors**, and the largest errors are mostly real
+delays — the exact tail this project exists to measure. Removing them would truncate the
+distribution and flatter MBTA, producing a headline number that looks better precisely
+because the worst outcomes were deleted. That is the same failure as dropping unfulfilled
+predictions, wearing a different hat.
+
+So the flag catches *matcher faults*, not transit events. A non-zero count means go and
+read the matcher, not clean the data.
+
+### Idempotency
+
+Re-running must improve, never degrade. Upsert on `(service_date, trip_id, stop_id)`, and
+the `DO UPDATE` carries a guard: it fires only when the new source ranks strictly higher
+than the stored one, or ranks equal with a tighter uncertainty.
+
+Verified against real data: back-to-back runs over 220 arrivals changed nothing — not the
+source, the arrival time, the uncertainty, nor even `matched_at`, which proves the UPDATE
+never fired rather than rewriting identical values. Degrading a row to
+`unresolved_dropout` by hand and re-running restored it to `stopped_at`.
+
+### Scheduling and cost
+
+A second cron at `*/15`. Cloudflare delivers **each cron expression as its own event**, so
+the handler branches on `event.cron`; running the collector in both would double-collect
+every fifteenth minute.
+
+The scan is bounded by a rowid watermark in `collector_state`. `prediction_snapshots` has no
+secondary index, and snapshots are appended in id order, so a rowid range is an efficient
+proxy for a time window. The watermark advances only past fully settled candidates — it
+stops just short of the earliest unsettled row, so in-flight trips are re-read next run
+rather than written off.
+
+A (trip, stop) is judged only once its last predicted arrival is 30 minutes past.
+
+Measured cost per run: ~11 arrivals written plus 1 watermark, ~1,150 writes/day against the
+collector's ~33,000. Reads are the larger share at roughly 400k/day against 5M.
+
+`POST /backfill?token=` runs a full pass over all collected data, separate from the cron.
+Safe at any time: every write is confidence-guarded.
+
+### A bug this shipped with, and how it was caught
+
+The first deployed version searched for the turnaround `STOPPED_AT` without bounding the
+time window. A vehicle turns around at the same terminus many times a day, so "earliest
+`STOPPED_AT` at this stop by this vehicle" found the first of the *day*. Production check:
+**167 of 182 turnaround arrivals were wrong by over an hour**, the worst by 16 hours.
+
+The search is now anchored to the trip's own last sighting. Bracketing went from 7% to 96%
+and no arrival is off by more than an hour. Five regression tests pin it.
+
+It was caught by checking `actual_arrival_at` against `predicted_arrival` for plausibility
+rather than by trusting that the run reported no errors — the run reported none, because
+nothing threw.
+
+## Limitations
+
+Things that are true of the current dataset and would mislead anyone reading a headline
+number without them.
+
+**All collected data so far is weekend data, with the Green Line E branch suspended.**
+Collection began 2026-08-01, a Saturday, during the Aug 1–2 Green-E shutdown. Every figure
+in this README is therefore weekend service on Orange and bus 39 only, with two of the ten
+watched slices contributing nothing. Weekday rush hour has denser headways, more crowding,
+and different failure modes. **Do not generalise these numbers to weekday service.** The
+second Green-E suspension runs Aug 8–16, so the first genuinely representative window is
+narrow — roughly Aug 3–7 — until after Aug 17.
+
+**The 0–3 minute bucket is not really a forecast.** At short horizons MBTA's prediction is
+derived from live vehicle position: the train is already visible, approaching, and often
+`INCOMING_AT` the stop. The prediction is closer to an observation than a forecast, which is
+why median error there is +4s rather than anything interesting. The bucket is worth keeping
+— it is what a rider on the platform sees — but it should not be read as evidence that MBTA
+forecasts well. The 6–12 and 12–20 buckets are where forecasting actually happens, and error
+there is 6–9x larger.
+
+**`stopped_at` carries a small positive bias.** Actual arrival is taken as the *first*
+observation with `current_status = STOPPED_AT`, which is at or after the moment the train
+physically arrived — never before. With 60-second polling and MBTA's own `updated_at`
+timestamps, that lag is bounded by roughly our poll interval and is one-directional. So
+measured error skews slightly late, and the true median error is a little smaller than
+reported. `uncertainty_sec = 30` on those rows is an estimate of the magnitude, not a
+measurement of it. The bias applies to every bucket roughly equally, so comparisons
+*between* buckets and *between* stops remain sound; only the absolute level is affected.
+
+Related and already handled elsewhere: `stopped_at_turnaround` brackets rather than
+point-estimates precisely to avoid a much larger version of this same bias at termini.
 
 ## Guardrails
 
@@ -365,7 +548,7 @@ push a statement over the limit.
 ## Tests
 
 ```bash
-npm test        # 87 tests
+npm test        # 126 tests
 npm run typecheck
 ```
 
@@ -394,6 +577,9 @@ migrations/0001_init.sql              schema + first four watched stops
 migrations/0002_alerts_and_stops.sql  alerts, per-slice counts, six more slices
 migrations/0003_write_budget_guardrails.sql  write accounting + error classification
 migrations/0004_first_seen_and_concurrency.sql  prediction origin, CAS, cap marker
+migrations/0005_matcher.sql           match_key, evidence span
+migrations/0006_plausibility.sql      implausible flag
+src/matcher.ts                        step 4: prediction -> actual arrival
 src/index.ts                          cron entrypoint, /status, /collect
 src/status.ts                         write-budget counter, projection, staleness
 src/collector.ts                      one tick: fetch, filter, dedup, write

@@ -1,0 +1,47 @@
+-- MBTA Reliability Tracker — migration 0005
+--
+-- Support for the matcher (build step 4).
+--
+-- ---------------------------------------------------------------------------
+-- Which key resolved the vehicle observation to the prediction.
+--
+-- 'stop_sequence' is preferred because stop_id is mutable on the V3 API, and
+-- keying on a mutable field is how this project would silently mismatch Commuter
+-- Rail track reassignments if it ever watched them.
+--
+-- Recorded rather than assumed: measured over 25.6h of collected data, matching
+-- by stop_sequence and by stop_id agreed on 596 of 596 cases. Zero disagreement
+-- so far. The preference is insurance, not a fix for an observed fault, and this
+-- column is what will eventually prove or disprove that it was needed.
+-- ---------------------------------------------------------------------------
+ALTER TABLE arrivals ADD COLUMN match_key TEXT;   -- 'stop_sequence' | 'stop_id' | NULL
+
+-- ---------------------------------------------------------------------------
+-- Evidence bracket width, in seconds.
+--
+-- For every bracketed source ('sequence_advanced', 'stopped_at_turnaround') the
+-- actual arrival is the midpoint of two observations and uncertainty_sec is half
+-- the width. Storing the width itself as well means the bracket can be audited
+-- later without recomputing it from raw observations, and it makes the
+-- reassignment-lag distribution at termini directly queryable.
+-- ---------------------------------------------------------------------------
+ALTER TABLE arrivals ADD COLUMN evidence_span_sec INTEGER;
+
+-- ---------------------------------------------------------------------------
+-- Note on `source`, which needs no schema change but gains two values.
+--
+--   'stopped_at_turnaround'  Terminus arrivals. At Forest Hills dir 0 the vehicle
+--                            is reassigned to its next outbound trip the moment
+--                            it arrives, so the STOPPED_AT event is filed under a
+--                            DIFFERENT trip_id (dir 1, stop_sequence 1). Measured:
+--                            0 of 169 terminus arrivals are findable by trip_id;
+--                            166 of 169 are findable by vehicle_id. Bracketed
+--                            rather than point-estimated — see src/matcher.ts.
+--
+--   'no_arrival_predicted'   MBTA published a departure time but never an arrival
+--                            time, so there is nothing to grade. 302 of 1,366
+--                            observed prediction-stops. NOT a failure and NOT
+--                            counted in the unfulfilled rate: it is un-promised,
+--                            not unfulfilled. These rows exist so the distinction
+--                            is visible rather than inferred from absence.
+-- ---------------------------------------------------------------------------
