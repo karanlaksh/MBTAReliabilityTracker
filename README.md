@@ -255,6 +255,52 @@ large enough to notice. The horizon cap costs none of that, so it was preferred.
 The existing ~8,800 rows above the cap were **not deleted**. They are the reference sample
 that justifies the cutoff, and the cap applies going forward only.
 
+#### ⚠️ Rollups spanning the cap must filter on horizon
+
+Because the cap applies going forward only, the dataset has two eras. Rows before the
+activation instant include predictions at every horizon; rows after it are capped at 1200s.
+
+**Any rollup, chart, or model that spans the boundary must filter
+`horizon_sec <= 1200 OR horizon_sec IS NULL`.** Without it, the pre-cap era will appear to
+have systematically worse accuracy purely because it contains long-horizon predictions the
+post-cap era does not — a pure artefact of the collection change, and one that looks exactly
+like a real finding.
+
+The activation instant is recorded in the database rather than in a comment, so the filter
+can be derived rather than remembered:
+
+```sql
+SELECT json_extract(value, '$.activated_at'), json_extract(value, '$.max_horizon_sec')
+  FROM collector_state WHERE key = 'horizon_cap_activated_at';
+```
+
+It is stored as JSON so the threshold travels with the timestamp. Changing
+`MAX_STORED_HORIZON_SEC` later needs a new marker, not a silent reinterpretation of this one.
+
+### What a prediction's origin looks like
+
+The cap created a second problem it also had to solve. The first row *stored* for a
+prediction is usually not the first time it was *seen* — production showed trip 78493012
+first stored at `revision: 67`, having been revised 66 times outside the window. The
+revision count survived, but MBTA's original estimate did not, and "what did they first say
+and how far did it move" is the question this project exists to answer.
+
+`first_seen_at` and `first_predicted_arrival` are captured on the first observation at any
+horizon, held in the dedup state, and stamped on every row the prediction produces. They
+repeat across a prediction's rows deliberately — D1 bills rows written, not columns, so
+denormalising them is free. That makes drift a subtraction:
+
+```sql
+SELECT trip_id, revision,
+       predicted_arrival - first_predicted_arrival AS drift_sec,
+       observed_at - first_seen_at                 AS tracked_for_sec
+  FROM prediction_snapshots WHERE first_predicted_arrival IS NOT NULL;
+```
+
+Rows written before migration 0004 have NULL for both, as do predictions whose dedup entry
+predates it (they age out within about an hour of deploy). Not backfilled: the information
+was never captured, and inventing it would be worse than admitting the gap.
+
 ## Design decisions in this code
 
 **Stop ids are normalised to parent stations.** Predictions and vehicles reference platform
@@ -272,6 +318,19 @@ on its own. The linger exists because subway dwell time is often shorter than th
 interval: when we miss `STOPPED_AT`, the only evidence the train served the stop is the
 *next* observation, where `current_stop_sequence` has advanced past it. That is the
 `sequence_advanced` arrival source.
+
+**The dedup state row is claimed by compare-and-set, not just overwritten.** Production
+disproved the original single-writer assumption: two invocations arrived 2 seconds apart in
+324 intervals, at a deploy boundary. `loadState` returns the row's `updated_at`;
+`claimState` writes only if it is unchanged. A tick that loses the claim writes nothing and
+records `concurrent_tick = 1`, visible on `/status` under `concurrency` so a deploy-boundary
+cluster can be told apart from an ongoing overlap.
+
+The claim runs *before* the data batch rather than inside it, which is a deliberate trade.
+Claiming first means a losing tick writes nothing at all — the point, since it must not
+duplicate the winner's rows or overwrite its revision increments. The cost is that state
+commits before the rows it describes, so `releaseState` rolls the claim back if the batch
+then fails. That is a smaller loss than silently dropped revision counts.
 
 **One dedup row, not two.** `migrations/0001_init.sql` names `prediction_state` and
 `vehicle_state`; this uses a single `dedup` key holding both, because two rows is two writes
@@ -306,7 +365,7 @@ push a statement over the limit.
 ## Tests
 
 ```bash
-npm test        # 73 tests
+npm test        # 87 tests
 npm run typecheck
 ```
 
@@ -323,6 +382,10 @@ Coverage is concentrated on what fails silently rather than loudly:
   classification against error text captured from real D1 failures
 - the horizon cap: the 1200s boundary on both sides, NULL and negative horizons, and
   above all that `revision` keeps incrementing while writes are suppressed
+- `first_seen_at` / `first_predicted_arrival` surviving suppressed writes, and stamping
+  NULL rather than guessing for pre-migration state entries
+- the compare-and-set claim, including two ticks arriving in the same second and rollback
+  not clobbering a newer writer
 
 ## Layout
 
@@ -330,6 +393,7 @@ Coverage is concentrated on what fails silently rather than loudly:
 migrations/0001_init.sql              schema + first four watched stops
 migrations/0002_alerts_and_stops.sql  alerts, per-slice counts, six more slices
 migrations/0003_write_budget_guardrails.sql  write accounting + error classification
+migrations/0004_first_seen_and_concurrency.sql  prediction origin, CAS, cap marker
 src/index.ts                          cron entrypoint, /status, /collect
 src/status.ts                         write-budget counter, projection, staleness
 src/collector.ts                      one tick: fetch, filter, dedup, write

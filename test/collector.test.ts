@@ -14,6 +14,8 @@ const argsOf = (r: unknown) => r as unknown[];
 // Column order matches the INSERT in collector.ts.
 const P = {
   serviceDate: 1,
+  firstSeenAt: 17,
+  firstPredictedArrival: 18,
   tripId: 2,
   stopSequence: 3,
   stopId: 6,
@@ -411,5 +413,84 @@ describe('horizon cap', () => {
     const late = runPredictions([prediction({ trip: 'overdue' })], [], state, T0 + 420);
     expect(late.rows).toHaveLength(1);
     expect(argsOf(late.rows[0])[P.horizonSec]).toBe(-120);
+  });
+});
+
+describe('first_seen_at / first_predicted_arrival', () => {
+  let state: DedupState;
+  beforeEach(() => {
+    state = emptyState('2026-08-01');
+  });
+
+  it('stamps the first observation on a brand-new prediction', () => {
+    const { rows } = runPredictions([prediction({})], [], state, T0);
+    const a = argsOf(rows[0]);
+    expect(a[P.firstSeenAt]).toBe(T0);
+    expect(a[P.firstPredictedArrival]).toBe(at('2026-08-01T12:05:00-04:00'));
+  });
+
+  it('keeps the ORIGINAL values as the prediction is revised', () => {
+    runPredictions([prediction({})], [], state, T0);
+    const { rows } = runPredictions(
+      [prediction({ arrival: '2026-08-01T12:09:00-04:00' })],
+      [],
+      state,
+      T0 + 60,
+    );
+    const a = argsOf(rows[0]);
+    // Still the first sighting and the first estimate, not this tick's.
+    expect(a[P.firstSeenAt]).toBe(T0);
+    expect(a[P.firstPredictedArrival]).toBe(at('2026-08-01T12:05:00-04:00'));
+    expect(a[P.predictedArrival]).toBe(at('2026-08-01T12:09:00-04:00'));
+  });
+
+  it('survives writes suppressed by the horizon cap — the reason it exists', () => {
+    // Reproduces trip 78493012: revised repeatedly far outside the window, so the
+    // first row ever STORED must still carry what MBTA originally said.
+    const trip = 'origin-carrier';
+    const original = '2026-08-01T12:40:00-04:00';
+    runPredictions([prediction({ trip, arrival: original })], [], state, T0); // suppressed
+    runPredictions([prediction({ trip, arrival: '2026-08-01T12:41:00-04:00' })], [], state, T0 + 60);
+    runPredictions([prediction({ trip, arrival: '2026-08-01T12:42:00-04:00' })], [], state, T0 + 120);
+
+    const inWindow = at('2026-08-01T12:25:00-04:00');
+    const { rows } = runPredictions(
+      [prediction({ trip, arrival: '2026-08-01T12:43:00-04:00' })],
+      [],
+      state,
+      inWindow,
+    );
+
+    expect(rows).toHaveLength(1);
+    const a = argsOf(rows[0]);
+    expect(a[P.firstSeenAt]).toBe(T0); // 25 minutes before this row was written
+    expect(a[P.firstPredictedArrival]).toBe(at(original));
+    expect(a[P.revision]).toBe(4);
+    // The whole point: original estimate 12:40, now saying 12:43 — 3 minutes of
+    // drift that would have been invisible.
+    expect((a[P.predictedArrival] as number) - (a[P.firstPredictedArrival] as number)).toBe(180);
+  });
+
+  it('records a NULL first estimate when the prediction never had an arrival time', () => {
+    const { rows } = runPredictions(
+      [prediction({ trip: 'no-arrival', arrival: null })],
+      [],
+      state,
+      T0,
+    );
+    const a = argsOf(rows[0]);
+    expect(a[P.firstSeenAt]).toBe(T0);
+    expect(a[P.firstPredictedArrival]).toBeNull();
+  });
+
+  it('stamps NULL rather than guessing for pre-migration state entries', () => {
+    // A 3-element entry predates this feature and cannot say when it was first
+    // seen. Inventing the current tick would be worse than admitting the gap.
+    state.p['trip1|140'] = ['stale-fingerprint', 7, T0 - 600];
+    const { rows } = runPredictions([prediction({})], [], state, T0);
+    const a = argsOf(rows[0]);
+    expect(a[P.firstSeenAt]).toBeNull();
+    expect(a[P.firstPredictedArrival]).toBeNull();
+    expect(a[P.revision]).toBe(8); // revision continuity is unaffected
   });
 });

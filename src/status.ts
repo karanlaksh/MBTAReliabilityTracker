@@ -90,6 +90,7 @@ interface RunRow {
   error: string | null;
   error_kind: string | null;
   per_slice_counts: string | null;
+  concurrent_tick: number | null;
 }
 
 /**
@@ -106,7 +107,8 @@ export async function buildStatus(env: Env, now: number): Promise<Record<string,
   const [last, today, hour, failures] = await Promise.all([
     env.DB.prepare(
       `SELECT started_at, duration_ms, predictions_seen, snapshots_written,
-              vehicle_rows_written, rows_written, api_status, error, error_kind, per_slice_counts
+              vehicle_rows_written, rows_written, api_status, error, error_kind,
+              per_slice_counts, concurrent_tick
          FROM collector_runs ORDER BY id DESC LIMIT 1`,
     ).first<RunRow>(),
 
@@ -114,11 +116,20 @@ export async function buildStatus(env: Env, now: number): Promise<Record<string,
       `SELECT COUNT(*) AS runs,
               COALESCE(SUM(${ROWS_WRITTEN_SQL}), 0) AS writes,
               COALESCE(SUM(snapshots_written), 0) AS snapshots,
-              SUM(CASE WHEN error IS NOT NULL THEN 1 ELSE 0 END) AS failed
+              SUM(CASE WHEN error IS NOT NULL THEN 1 ELSE 0 END) AS failed,
+              COALESCE(SUM(concurrent_tick), 0) AS concurrent,
+              MAX(CASE WHEN concurrent_tick = 1 THEN started_at END) AS last_concurrent_at
          FROM collector_runs WHERE started_at >= ?`,
     )
       .bind(dayStart)
-      .first<{ runs: number; writes: number; snapshots: number; failed: number }>(),
+      .first<{
+        runs: number;
+        writes: number;
+        snapshots: number;
+        failed: number;
+        concurrent: number;
+        last_concurrent_at: number | null;
+      }>(),
 
     env.DB.prepare(
       `SELECT COALESCE(SUM(${ROWS_WRITTEN_SQL}), 0) AS writes, COUNT(*) AS runs
@@ -175,6 +186,16 @@ export async function buildStatus(env: Env, now: number): Promise<Record<string,
       // boundary used elsewhere in this project.
       utc_day_start: dayStart,
       seconds_until_reset: dayStart + DAY_SEC - now,
+    },
+
+    // --- concurrency --------------------------------------------------------
+    // Ticks that stood down because another invocation held the dedup state row.
+    // A cluster of these at a deploy timestamp is the known benign artefact; a
+    // steady trickle at ordinary times is not, and means cron delivery is
+    // genuinely overlapping.
+    concurrency: {
+      concurrent_ticks_today: Number(today?.concurrent ?? 0),
+      last_concurrent_at: today?.last_concurrent_at ?? null,
     },
 
     // --- failures, classified ----------------------------------------------

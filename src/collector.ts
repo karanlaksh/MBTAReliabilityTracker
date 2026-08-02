@@ -19,7 +19,7 @@ import {
   type Document,
 } from './mbta';
 import { localHour, serviceDate } from './service-date';
-import { loadState, pruneState, saveStatement, type DedupState } from './state';
+import { claimState, loadState, pruneState, releaseState, type DedupState } from './state';
 
 export interface Env {
   DB: D1Database;
@@ -65,6 +65,12 @@ export interface RunRecord {
    * drop in writes/tick.
    */
   horizon_suppressed: number;
+  /**
+   * True when another invocation held the dedup state row and this tick stood
+   * down rather than clobbering it. Persisted, so /status can distinguish a
+   * deploy-boundary artefact from an ongoing problem.
+   */
+  concurrent_tick: boolean;
 }
 
 export type ErrorKind = 'd1_limit' | 'd1_other' | 'mbta_api' | 'timeout' | 'other';
@@ -236,6 +242,10 @@ const PREDICTION_COLUMNS = [
   'vehicle_status',
   'vehicle_stop_sequence',
   'scheduled_arrival',
+  // Properties of the prediction rather than of this snapshot, repeated on every
+  // row it produces. Free: D1 bills rows written, not columns.
+  'first_seen_at',
+  'first_predicted_arrival',
 ];
 
 const VEHICLE_COLUMNS = [
@@ -286,6 +296,7 @@ export async function runTick(env: Env, startedAtMs: number): Promise<RunRecord>
     alerts_seen: 0,
     alert_rows_written: 0,
     horizon_suppressed: 0,
+    concurrent_tick: false,
   };
 
   try {
@@ -329,7 +340,11 @@ export async function runTick(env: Env, startedAtMs: number): Promise<RunRecord>
     run.api_status = 200;
 
     const parents = parentStationMap(predictionDoc, vehicleDoc);
-    const state = await loadState(env.DB, serviceDate(observedAt));
+    const loaded = await loadState(env.DB, serviceDate(observedAt));
+    const state = loaded.state;
+    // Snapshotted before we mutate `state`, so a failed batch can be rolled back
+    // to exactly what the database held when we read it.
+    const stateBeforeTick = JSON.stringify(state);
 
     const statements: D1PreparedStatement[] = [];
 
@@ -364,15 +379,46 @@ export async function runTick(env: Env, startedAtMs: number): Promise<RunRecord>
     }
 
     pruneState(state, observedAt);
-    statements.push(saveStatement(env.DB, state, observedAt));
 
-    // One round trip. D1 batch is a single implicit transaction, so either this
-    // tick's snapshots and its dedup state both land, or neither does — the
-    // state can never claim we recorded something we did not.
-    await env.DB.batch(statements);
+    // Claim the state row by compare-and-set BEFORE writing any data rows. If
+    // another invocation has moved it since we read it, that invocation owns this
+    // minute: stand down and write nothing rather than duplicate its rows and
+    // overwrite its revision increments.
+    const claim = await claimState(env.DB, state, observedAt, loaded.updatedAt);
+    if (!claim.won) {
+      run.concurrent_tick = true;
+      run.snapshots_written = 0;
+      run.vehicle_rows_written = 0;
+      run.alert_rows_written = 0;
+      console.warn('concurrent tick detected; standing down', {
+        started_at: observedAt,
+        state_updated_at: loaded.updatedAt,
+      });
+      return await finish(env, run, startedAtMs);
+    }
+
+    try {
+      // A tick where every prediction was unchanged or out of window has nothing
+      // to write. D1 rejects an empty batch outright ("No SQL statements
+      // detected"), and the claim above has already persisted the dedup touches,
+      // so there is genuinely nothing left to do.
+      if (statements.length > 0) {
+        // One round trip, one transaction: this tick's snapshots either all land
+        // or none do.
+        await env.DB.batch(statements);
+      }
+    } catch (batchErr) {
+      // We hold the claim but could not honour it. Put the state back, or the
+      // next tick will believe these snapshots were stored and skip them.
+      await releaseState(env.DB, stateBeforeTick, loaded.updatedAt, claim.updatedAt).catch(
+        (releaseErr: unknown) => console.error('failed to release state claim', releaseErr),
+      );
+      throw batchErr;
+    }
 
     // Counted only after the batch commits. On failure none of it landed, so
     // charging it to the budget would overstate our own consumption.
+    // +1 for the state claim.
     run.rows_written =
       run.snapshots_written + run.vehicle_rows_written + run.alert_rows_written + 1;
 
@@ -408,8 +454,8 @@ async function finish(env: Env, run: RunRecord, startedAtMs: number): Promise<Ru
       `INSERT INTO collector_runs
          (started_at, duration_ms, predictions_seen, snapshots_written,
           vehicles_seen, vehicle_rows_written, api_status, error, per_slice_counts,
-          alert_rows_written, rows_written, error_kind)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          alert_rows_written, rows_written, error_kind, concurrent_tick)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
       .bind(
         run.started_at,
@@ -429,6 +475,7 @@ async function finish(env: Env, run: RunRecord, startedAtMs: number): Promise<Ru
         // because this INSERT is itself a write against the daily quota.
         run.rows_written + 1,
         run.error_kind,
+        run.concurrent_tick ? 1 : 0,
       )
       .run();
     run.rows_written += 1;
@@ -520,7 +567,30 @@ function collectPredictions(
       continue;
     }
     const revision = previous ? previous[1] + 1 : 1;
-    state.p[key] = [fingerprint, revision, observedAt];
+
+    // Captured on the very first observation at ANY horizon and then carried
+    // forward unchanged. The horizon cap means the first row we STORE is usually
+    // not the first time we SAW this prediction, so without this MBTA's original
+    // estimate is lost — the thing this project is trying to measure movement
+    // against.
+    //
+    // A pre-0004 state entry has length 3 and cannot tell us when it was first
+    // seen. Those stamp NULL rather than pretending the current tick was the
+    // first; they age out within an hour of deploy.
+    let firstSeenAt: number | null;
+    let firstPredictedArrival: number | null;
+    if (!previous) {
+      firstSeenAt = observedAt;
+      firstPredictedArrival = predictedArrival;
+    } else if (previous.length === 5) {
+      firstSeenAt = previous[3];
+      firstPredictedArrival = previous[4];
+    } else {
+      firstSeenAt = null;
+      firstPredictedArrival = null;
+    }
+
+    state.p[key] = [fingerprint, revision, observedAt, firstSeenAt, firstPredictedArrival];
 
     // ---- horizon cap -------------------------------------------------------
     // Everything above this line is TRACKING and runs at every horizon. Only the
@@ -562,6 +632,8 @@ function collectPredictions(
       vehicle ? attrString(vehicle, 'current_status') : null,
       vehicle ? attrNumber(vehicle, 'current_stop_sequence') : null,
       schedule ? epochSec(attrString(schedule, 'arrival_time')) : null,
+      firstSeenAt,
+      firstPredictedArrival,
     ]);
   }
 
