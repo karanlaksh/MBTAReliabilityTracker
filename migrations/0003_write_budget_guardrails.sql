@@ -1,0 +1,52 @@
+-- MBTA Reliability Tracker — migration 0003
+--
+-- Purpose: make the D1 free-tier write budget observable before it bites, and
+-- make a budget failure distinguishable from every other kind of failure.
+--
+-- Motivation: measured write volume is ~60,000-95,000 rows/day against a hard
+-- 100,000/day free-tier limit. Exceeding it does not degrade gracefully — writes
+-- start failing, and the data lost in that window is unrecoverable. The counter
+-- on /status is what stands between a tight budget and a silent outage.
+--
+-- Note on the reset boundary: Cloudflare's daily quota resets at 00:00 UTC,
+-- which is NOT the 03:00 America/New_York service-date boundary used everywhere
+-- else in this schema. The budget counter deliberately works in UTC days. Mixing
+-- the two would misreport the budget by several hours' worth of writes every day.
+
+-- ---------------------------------------------------------------------------
+-- Exact per-tick write accounting.
+--
+-- rows_written is computed by the collector rather than derived at read time,
+-- because only the collector knows what actually landed: whether the batch
+-- committed, whether the dedup-state upsert was included, and how many rows the
+-- daily prune deleted (deletes count against the write quota too).
+--
+-- Costs no additional writes — these are columns on a row we already insert.
+-- ---------------------------------------------------------------------------
+ALTER TABLE collector_runs ADD COLUMN alert_rows_written INTEGER;
+ALTER TABLE collector_runs ADD COLUMN rows_written INTEGER;
+
+-- ---------------------------------------------------------------------------
+-- Failure classification.
+--
+--   'd1_limit'  D1 refused the write — quota, rate limit, or storage cap.
+--               The one that means we are actively losing data.
+--   'd1_other'  D1 failed for some other reason (syntax, constraint, timeout).
+--   'mbta_api'  MBTA returned a non-2xx. Annoying, not data loss: the next tick
+--               re-reads the same predictions.
+--   'timeout'   Our own fetch timeout tripped.
+--   'other'     Unclassified. Read `error` for the raw message.
+--
+-- Classification is by message substring and is therefore HEURISTIC. D1 does not
+-- expose a stable machine-readable code through the Workers binding, so the
+-- matcher lives in src/collector.ts next to a list of the markers it looks for.
+-- A misclassified row is still fully diagnosable — `error` keeps the raw text.
+--
+-- IMPORTANT LIMITATION: when D1 is refusing writes, the INSERT that would record
+-- error_kind = 'd1_limit' is itself refused. This column captures partial
+-- failures (batch rejected, run row accepted), not a total write outage. A total
+-- outage shows up as an absence of collector_runs rows, which is why /status
+-- reports staleness independently, and why the collector also logs to console
+-- where Workers observability can see it without touching D1.
+-- ---------------------------------------------------------------------------
+ALTER TABLE collector_runs ADD COLUMN error_kind TEXT;

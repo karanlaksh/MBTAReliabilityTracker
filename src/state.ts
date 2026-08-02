@@ -15,6 +15,16 @@
 // does not overlap scheduled invocations of the same trigger. If a second writer
 // ever appears — a manual backfill, a second Worker — this row will silently
 // lose updates. Named here so nobody has to discover it.
+//
+// OBSERVED, 2026-08-02: one pair of invocations 2 seconds apart in 324 intervals,
+// at the exact moment of a deploy. Cron delivery is therefore not strictly
+// once-per-minute across a version rollover. That instance was harmless — the
+// second tick saw only 8 changed predictions where the first saw 49, proving it
+// had already read the first's committed state, so they ran sequentially rather
+// than concurrently. Worth knowing that the assumption is "almost always true"
+// rather than "guaranteed". A genuinely concurrent pair would cost one tick's
+// revision increments and a few duplicate snapshots; it would not corrupt
+// anything, because every table here is append-only.
 
 /** Entries untouched for this long are dropped, to bound the row's size. */
 const STALE_SEC = 3_600;

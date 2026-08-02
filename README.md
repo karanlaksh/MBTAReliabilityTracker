@@ -15,7 +15,7 @@ Design rationale lives in [CLAUDE.md](CLAUDE.md). This file covers running it.
 
 | Stage | State |
 |-------|-------|
-| 1. Schema | done — `migrations/0001_init.sql`, `0002_alerts_and_stops.sql` |
+| 1. Schema | done — `migrations/0001*`, `0002*`, `0003*` |
 | 2. Collector (this) | done, deployed, collecting |
 | 3. Status page | next |
 | 4. Matching logic | not started |
@@ -66,11 +66,11 @@ npm run deploy
 Verify:
 
 ```bash
-curl https://<your-worker>.workers.dev/health
+curl https://<your-worker>.workers.dev/status
 ```
 
-`seconds_since_last_run` should stay under ~90. Anything larger means ticks are being
-missed, which means data is being lost that cannot be backfilled.
+Returns **200** while healthy and **503** when it is not, so uptime monitoring can watch
+the status code alone without parsing the body. See the guardrails section below.
 
 ### Local
 
@@ -105,6 +105,90 @@ Numbers below are from live ticks against the real API on 2026-08-01, at low-ser
 Green-E contributes 0 of the 10-slice numbers above — it is suspended (see below), so
 expect roughly 14 more predictions per tick once it returns.
 
+## Guardrails
+
+On the free tier the daily write cap is the thing most likely to take this down, and it
+fails silently: writes start being rejected, and the minutes lost while nobody notices are
+unrecoverable. Three mechanisms cover it.
+
+### 1. The write counter on `/status`
+
+Every tick records `collector_runs.rows_written` — the exact number of D1 rows it spent,
+including the dedup-state upsert, the run row itself, and any rows the daily prune deleted
+(deletes count against the quota too). `/status` sums that for the current day and projects
+forward:
+
+```json
+"write_budget": {
+  "limit": 100000,
+  "used_today": 69,
+  "remaining": 99931,
+  "pct_used": 0.1,
+  "pct_projected": 2.7,
+  "projected_eod": 2671,
+  "projected_by_recent_rate": 2671,
+  "projected_by_flat_rate": 2671,
+  "level": "ok",
+  "writes_last_hour": 69,
+  "seconds_until_reset": 84168
+}
+```
+
+Two projections, because neither is trustworthy alone. `recent_rate` extrapolates the last
+hour and reacts immediately but overshoots at rush hour; `flat_rate` extrapolates today's
+average and is steadier but slow. **`level` uses the higher of the two** — a guardrail that
+under-reports is worse than none, given what it guards against is silent.
+
+`level` is `ok` below 70%, `warn` at 70–90%, `critical` at 90%+.
+
+**The reset boundary is 00:00 UTC, not the 03:00 service date.** Cloudflare's quota day and
+this project's service date are different things; conflating them would misreport the
+budget by 4–5 hours of writes daily. `src/status.ts` works in UTC deliberately, and there is
+a test asserting exactly that.
+
+### 2. D1 limit failures are classified apart from everything else
+
+`collector_runs.error_kind` separates the failure that destroys data from the ones that do
+not:
+
+| kind | meaning |
+|------|---------|
+| `d1_limit` | D1 refused the write — quota, rate, or storage. **Data is being lost.** |
+| `d1_other` | D1 ran and refused — syntax, constraint, missing column. |
+| `mbta_api` | MBTA returned non-2xx. The next tick re-reads the same predictions. |
+| `timeout` | Our own 10s fetch timeout tripped. |
+| `other` | Unclassified; read the raw `error` column. |
+
+`/status` exposes `failures.d1_limit_hits_today` and a `by_kind` breakdown, so a budget
+failure is never buried under a pile of unrelated MBTA 503s.
+
+Classification is a heuristic over message text — D1 exposes no stable machine-readable
+code through the Workers binding. The marker lists live in `src/collector.ts` and are
+checked in that order, so a message matching both a limit marker and a generic D1 marker is
+filed as the limit. Verified against real D1 error text, which turns out not to carry a
+`D1_ERROR` prefix at all: a bad column surfaces as `table X has no column named Y:
+SQLITE_ERROR`. An earlier version of the classifier missed all of those.
+
+### 3. Staleness, because a total write outage cannot record itself
+
+If D1 is refusing writes outright, the `collector_runs` INSERT that would record
+`error_kind = 'd1_limit'` is itself refused. So `error_kind` catches *partial* failures
+(batch rejected, run row accepted) but cannot catch a total one.
+
+A total outage instead shows up as an absence of rows. `/status` reports `stale` when the
+last run is more than 150s old — a tick is due every 60s — and returns 503. The collector
+also `console.error`s every failure with its classification, so Workers observability sees
+it without touching D1 at all.
+
+Verified end-to-end: with the collector stopped, `/status` flipped to 503 with
+`collecting: false` at 158s.
+
+### What is deliberately not here
+
+There is **no automatic load-shedding**. The collector will not start dropping slices to
+stay under budget, because silently collecting less is a worse failure than collecting
+nothing and saying so. If `level` reaches `warn`, the levers are manual and listed below.
+
 ### The write budget is the binding constraint
 
 **Dedup is much weaker than the write budget in CLAUDE.md assumes**, and this is a property
@@ -117,27 +201,59 @@ Measured over 60 consecutive production ticks (Saturday evening, Green-E suspend
 
 | Source | Writes/day |
 |--------|-----------:|
-| prediction_snapshots | ~70,000–85,000 |
+| prediction_snapshots (before the horizon cap) | ~70,000–85,000 |
+| prediction_snapshots (after) | ~28,000–34,000 |
 | vehicle_observations | ~5,000 |
 | collector_state | 1,440 |
 | collector_runs | 1,440 |
 | daily prune of collector_runs | 1,440 |
 | alert_snapshots | ~100 |
-| **Total** | **~80,000–95,000** |
+| **Total before cap** | **~80,000–95,000** |
+| **Total after cap** | **~38,000–44,000** |
 
 Against a **100,000/day** hard limit. The range accounts for overnight lulls, rush-hour
-peaks, and roughly +14 predictions/tick when Green-E returns. **This is tight, and it is
-the thing to watch first** in the Cloudflare dashboard under D1 > Metrics > Row Metrics.
+peaks, and roughly +14 predictions/tick when Green-E returns. Before the horizon cap this
+was uncomfortably tight; after it there is roughly 2.4x headroom, which is enough to absorb
+Green-E's return and several more slices. Confirm against a full weekday in the Cloudflare
+dashboard under D1 > Metrics > Row Metrics before adding any.
 
-The lever, if it needs to come down: a **jitter tolerance** — treat a predicted-arrival
-change smaller than N seconds as no change. Measured against real collected data, ignoring
-changes under 10s would suppress ~62% of revisions, and under 15s ~68%. That is a 2–3x
-reduction in the dominant write source.
+### Scoping vs. sampling: the horizon cap, and the jitter threshold that was rejected
 
-It is deliberately **not implemented**. A 1-second revision is model noise rather than new
-information, and the signal being measured is 30–300 seconds wide, so the cost to accuracy
-is small — but it changes what `revision` means and slightly stales the stored prediction,
-and that is a data-semantics decision worth making deliberately rather than by default.
+Two ways to cut the dominant write source were considered. They are not the same kind of
+decision, and only one was taken.
+
+**Taken — a horizon cap (`MAX_STORED_HORIZON_SEC = 1200`).** No `prediction_snapshots` row
+is written for a prediction more than 20 minutes from its arrival. Measured across 14,806
+collected rows, those accounted for 8,813 — **63.2% of rows carrying a horizon**, or 59.5%
+of all rows once the 868 NULL-horizon rows are counted. They dominate the budget while
+carrying the least information: a 45-minute-out estimate is close to a restatement of the
+timetable and will be revised many times before it means anything.
+
+This is a **scoping** decision. It declares a range of interest — the last 20 minutes
+before arrival — and keeps *complete* fidelity inside it: every revision, full resolution,
+unbroken revision count. Nothing within the range is thinned or approximated. A prediction
+outside the range is out of scope, not sampled away.
+
+Three properties make that true, and each is enforced by a test:
+
+- **The cap gates the write, not the tracking.** Dedup state and `revision` are updated for
+  every observed change at every horizon. `revision` keeps meaning "total times MBTA revised
+  this arrival", not "times since it entered the window" — different features, and the
+  November model needs the former. A prediction revised three times at 40 minutes out and
+  once at 18 minutes out is stored once, with `revision = 4`.
+- **NULL horizons are always written.** No arrival time means a skipped stop, a cancelled
+  trip, or a vehicle that will not serve the stop. Rare, and the interesting failures.
+- **Negative horizons are inside the window** by definition — an overdue prediction MBTA is
+  still publishing is exactly the case worth having.
+
+**Rejected — a jitter tolerance.** Treating a predicted-arrival change under N seconds as
+no change would suppress ~62% of revisions at 10s and ~68% at 15s: a comparable saving. But
+it is a **sampling** decision. It degrades fidelity *within* the range of interest, leaves
+the stored value up to N seconds stale, and redefines `revision` to count only revisions
+large enough to notice. The horizon cap costs none of that, so it was preferred.
+
+The existing ~8,800 rows above the cap were **not deleted**. They are the reference sample
+that justifies the cutoff, and the cap applies going forward only.
 
 ## Design decisions in this code
 
@@ -190,7 +306,7 @@ push a statement over the limit.
 ## Tests
 
 ```bash
-npm test        # 49 tests
+npm test        # 73 tests
 npm run typecheck
 ```
 
@@ -203,13 +319,19 @@ Coverage is concentrated on what fails silently rather than loudly:
   alignment — because a bug there corrupts data without throwing
 - alert period selection and the `affects_watched` matching rules, including the line-wide
   alert that names a route but no stop
+- the write-budget projection and its UTC-vs-service-date boundary, and error
+  classification against error text captured from real D1 failures
+- the horizon cap: the 1200s boundary on both sides, NULL and negative horizons, and
+  above all that `revision` keeps incrementing while writes are suppressed
 
 ## Layout
 
 ```
 migrations/0001_init.sql              schema + first four watched stops
 migrations/0002_alerts_and_stops.sql  alerts, per-slice counts, six more slices
-src/index.ts                          cron entrypoint, /health, /collect
+migrations/0003_write_budget_guardrails.sql  write accounting + error classification
+src/index.ts                          cron entrypoint, /status, /collect
+src/status.ts                         write-budget counter, projection, staleness
 src/collector.ts                      one tick: fetch, filter, dedup, write
 src/mbta.ts                           V3 API client and JSON:API helpers
 src/service-date.ts                   the 03:00 rollover

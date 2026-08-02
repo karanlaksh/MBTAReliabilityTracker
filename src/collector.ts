@@ -37,6 +37,14 @@ export interface RunRecord {
   vehicle_rows_written: number;
   api_status: number | null;
   error: string | null;
+  /** See classifyError. 'd1_limit' is the one that means we are losing data. */
+  error_kind: ErrorKind | null;
+  /**
+   * Total D1 rows this tick wrote, including the dedup-state upsert, this run
+   * row itself, and any rows the daily prune deleted. This is the number the
+   * free-tier budget is spent in, so it is recorded rather than re-derived.
+   */
+  rows_written: number;
   /**
    * '<stop>|<route>|<direction>' -> predictions seen this tick, with an explicit
    * 0 for every watched slice that returned none. The zero is the point: it is
@@ -50,6 +58,72 @@ export interface RunRecord {
    */
   alerts_seen: number;
   alert_rows_written: number;
+  /**
+   * Predictions observed and tracked (dedup state and `revision` both updated)
+   * but not written, because their horizon exceeded MAX_STORED_HORIZON_SEC.
+   * Not persisted; present so a deploy can be verified against the expected
+   * drop in writes/tick.
+   */
+  horizon_suppressed: number;
+}
+
+export type ErrorKind = 'd1_limit' | 'd1_other' | 'mbta_api' | 'timeout' | 'other';
+
+/**
+ * Substrings that mean "D1 refused this write because of a limit" rather than
+ * "D1 could not run this query".
+ *
+ * D1 does not expose a stable machine-readable code through the Workers binding,
+ * so this is necessarily a heuristic over message text. It is deliberately broad:
+ * a false positive costs a misleading label on a row whose raw `error` text is
+ * still there, while a false negative hides the one failure mode that silently
+ * destroys unrecoverable data.
+ */
+const D1_LIMIT_MARKERS = [
+  'daily limit',
+  'exceeded',
+  'quota',
+  'too many requests',
+  'rate limit',
+  'storage limit',
+  'database is full',
+  'over capacity',
+  '429',
+];
+
+/**
+ * Markers for "D1 ran and refused" as opposed to "D1 was over a limit".
+ * Confirmed against live D1 error text, which does not reliably carry a
+ * 'D1_ERROR' prefix.
+ */
+const D1_OTHER_MARKERS = [
+  'd1_error',
+  'sqlite_error',
+  'sqlite_constraint',
+  'no such table',
+  'no such column',
+  'has no column named',
+  'unique constraint',
+];
+
+export function classifyError(err: unknown): ErrorKind {
+  if (err instanceof MbtaError) return 'mbta_api';
+
+  const name = err instanceof Error ? err.name : '';
+  const message = (err instanceof Error ? err.message : String(err)).toLowerCase();
+
+  if (name === 'TimeoutError' || name === 'AbortError' || message.includes('timed out')) {
+    return 'timeout';
+  }
+  if (D1_LIMIT_MARKERS.some((m) => message.includes(m))) return 'd1_limit';
+  // Checked after the limit markers: a limit failure also mentions D1, and the
+  // limit label is the more useful of the two.
+  //
+  // The marker list is wider than 'D1_ERROR' because that prefix is not
+  // guaranteed. Verified against real failures: a bad column surfaces as
+  // "table X has no column named Y: SQLITE_ERROR" with no D1 prefix at all.
+  if (D1_OTHER_MARKERS.some((m) => message.includes(m))) return 'd1_other';
+  return 'other';
 }
 
 interface WatchedStop {
@@ -79,6 +153,38 @@ const RUN_RETENTION_SEC = 7 * 86_400;
  * that adding a column later cannot silently push a statement over the edge.
  */
 const MAX_BOUND_PARAMS = 80;
+
+/**
+ * Longest prediction horizon we store a snapshot for, in seconds (20 minutes).
+ *
+ * Measured against 14,806 collected rows: 8,813 were predictions more than 20
+ * minutes out — 63.2% of the rows that carry a horizon at all, or 59.5% of every
+ * row once the 868 NULL-horizon rows are included in the denominator. Either way
+ * they dominate the write budget while carrying the least information: a
+ * 45-minute-out estimate is close to a restatement of the timetable, and it will
+ * be revised many times before it means anything.
+ *
+ * Expected effect, from the same sample: 40.5% of rows survive the cap
+ * (34.6% within the window plus 5.9% NULL horizon), taking ~51 writes/tick to
+ * ~21.
+ *
+ * THIS IS A SCOPING DECISION, NOT A SAMPLING ONE. It declares a range of
+ * interest — the last 20 minutes before arrival — and keeps *complete* fidelity
+ * inside that range: every revision, at full resolution, with an unbroken
+ * revision count. It does not thin, average, or subsample anything within the
+ * window. A prediction outside the window is out of scope, not sampled away.
+ *
+ * Contrast with the jitter threshold considered and rejected (see README): that
+ * would have degraded fidelity *within* the range of interest by discarding
+ * sub-threshold revisions, making stored values slightly stale and changing what
+ * `revision` counts. This changes neither.
+ *
+ * The cap gates the WRITE only. Dedup state and `revision` are still updated for
+ * every observed change at every horizon, so `revision` continues to mean "total
+ * times MBTA revised this arrival" rather than "times since it entered the
+ * window". Those are different features and the November model needs the former.
+ */
+const MAX_STORED_HORIZON_SEC = 1200;
 
 /**
  * Collapse many single-row inserts into few multi-row inserts.
@@ -174,9 +280,12 @@ export async function runTick(env: Env, startedAtMs: number): Promise<RunRecord>
     vehicle_rows_written: 0,
     api_status: null,
     error: null,
+    error_kind: null,
+    rows_written: 0,
     per_slice_counts: {},
     alerts_seen: 0,
     alert_rows_written: 0,
+    horizon_suppressed: 0,
   };
 
   try {
@@ -235,6 +344,7 @@ export async function runTick(env: Env, startedAtMs: number): Promise<RunRecord>
     run.predictions_seen = predictions.seen;
     run.snapshots_written = predictions.rows.length;
     run.per_slice_counts = predictions.perSlice;
+    run.horizon_suppressed = predictions.horizonSuppressed;
     statements.push(
       ...chunkedInserts(env.DB, 'prediction_snapshots', PREDICTION_COLUMNS, predictions.rows),
     );
@@ -261,14 +371,26 @@ export async function runTick(env: Env, startedAtMs: number): Promise<RunRecord>
     // state can never claim we recorded something we did not.
     await env.DB.batch(statements);
 
+    // Counted only after the batch commits. On failure none of it landed, so
+    // charging it to the budget would overstate our own consumption.
+    run.rows_written =
+      run.snapshots_written + run.vehicle_rows_written + run.alert_rows_written + 1;
+
     if (shouldPrune(observedAt)) {
-      await env.DB.prepare('DELETE FROM collector_runs WHERE started_at < ?')
+      // Deletes count against the write quota exactly like inserts do.
+      const pruned = await env.DB.prepare('DELETE FROM collector_runs WHERE started_at < ?')
         .bind(observedAt - RUN_RETENTION_SEC)
         .run();
+      run.rows_written += pruned.meta?.changes ?? 0;
     }
   } catch (err) {
     run.error = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+    run.error_kind = classifyError(err);
     if (err instanceof MbtaError) run.api_status = err.status;
+    // Logged as well as stored, because the failure that matters most — D1
+    // refusing writes — is exactly the one that can stop the row below from
+    // being written at all. Workers observability sees this without touching D1.
+    console.error(`tick failed [${run.error_kind}]`, run.error);
   }
 
   return await finish(env, run, startedAtMs);
@@ -285,8 +407,9 @@ async function finish(env: Env, run: RunRecord, startedAtMs: number): Promise<Ru
     await env.DB.prepare(
       `INSERT INTO collector_runs
          (started_at, duration_ms, predictions_seen, snapshots_written,
-          vehicles_seen, vehicle_rows_written, api_status, error, per_slice_counts)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          vehicles_seen, vehicle_rows_written, api_status, error, per_slice_counts,
+          alert_rows_written, rows_written, error_kind)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
       .bind(
         run.started_at,
@@ -301,11 +424,20 @@ async function finish(env: Env, run: RunRecord, startedAtMs: number): Promise<Ru
         // "we counted zero everywhere" stays distinguishable from "we never got
         // far enough to count".
         Object.keys(run.per_slice_counts).length ? JSON.stringify(run.per_slice_counts) : null,
+        run.alert_rows_written,
+        // +1 for this row. Charged whether or not the batch above committed,
+        // because this INSERT is itself a write against the daily quota.
+        run.rows_written + 1,
+        run.error_kind,
       )
       .run();
+    run.rows_written += 1;
   } catch (err) {
-    // If even this fails the database is unreachable; surface it in the logs.
-    console.error('failed to write collector_runs row', err);
+    // If even this fails, D1 is refusing writes outright — which is precisely the
+    // budget-exhaustion case. There is no way to record it in the database, so
+    // console is the only channel left. /status detects it as staleness instead.
+    const kind = classifyError(err);
+    console.error(`failed to write collector_runs row [${kind}]`, err);
   }
   return run;
 }
@@ -326,7 +458,12 @@ function collectPredictions(
   slices: Set<string>,
   state: DedupState,
   observedAt: number,
-): { seen: number; rows: unknown[][]; perSlice: Record<string, number> } {
+): {
+  seen: number;
+  rows: unknown[][];
+  perSlice: Record<string, number>;
+  horizonSuppressed: number;
+} {
   const schedules = indexIncluded(doc, 'schedule');
   const vehicles = new Map(vehicleDoc.data.map((v) => [v.id, v]));
 
@@ -339,6 +476,7 @@ function collectPredictions(
   const rows: unknown[][] = [];
   const sd = serviceDate(observedAt);
   let seen = 0;
+  let horizonSuppressed = 0;
 
   for (const p of doc.data) {
     const tripId = relId(p, 'trip');
@@ -384,6 +522,23 @@ function collectPredictions(
     const revision = previous ? previous[1] + 1 : 1;
     state.p[key] = [fingerprint, revision, observedAt];
 
+    // ---- horizon cap -------------------------------------------------------
+    // Everything above this line is TRACKING and runs at every horizon. Only the
+    // row insert below is gated. That ordering is the whole point: `revision`
+    // must keep counting every revision MBTA ever made to this arrival, not just
+    // the ones we chose to store. Moving this check any earlier would silently
+    // redefine that feature.
+    //
+    // A NULL horizon means the prediction carries no arrival time at all — a
+    // skipped stop, a cancelled trip, a vehicle that will not serve this stop.
+    // Those are rare and they are the interesting failures, so they are always
+    // written.
+    const horizonSec = predictedArrival === null ? null : predictedArrival - observedAt;
+    if (horizonSec !== null && horizonSec > MAX_STORED_HORIZON_SEC) {
+      horizonSuppressed++;
+      continue;
+    }
+
     const vehicle = vehicles.get(relId(p, 'vehicle') ?? '') ?? null;
     const schedule = schedules.get(relId(p, 'schedule') ?? '') ?? null;
 
@@ -399,7 +554,7 @@ function collectPredictions(
       predictedDeparture,
       // Signed on purpose. Negative means the promised time has already passed
       // and MBTA is still showing the prediction — real, and worth keeping.
-      predictedArrival === null ? null : predictedArrival - observedAt,
+      horizonSec,
       scheduleRelationship,
       status,
       revision,
@@ -410,7 +565,7 @@ function collectPredictions(
     ]);
   }
 
-  return { seen, rows, perSlice };
+  return { seen, rows, perSlice, horizonSuppressed };
 }
 
 // --- vehicles ---------------------------------------------------------------

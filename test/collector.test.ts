@@ -302,3 +302,114 @@ describe('collectVehicles', () => {
     expect(runVehicles([v], state, T0).rows).toHaveLength(0);
   });
 });
+
+describe('horizon cap', () => {
+  let state: DedupState;
+  beforeEach(() => {
+    state = emptyState('2026-08-01');
+  });
+
+  // T0 is 12:00:00; the helper's default arrival is 12:05, so horizon = 300s.
+  const farOut = (trip: string, arrival: string) => prediction({ trip, arrival });
+
+  it('writes a prediction inside the 20-minute window', () => {
+    const { rows } = runPredictions([prediction({})], [], state, T0); // horizon 300
+    expect(rows).toHaveLength(1);
+    expect(argsOf(rows[0])[P.horizonSec]).toBe(300);
+  });
+
+  it('suppresses the write beyond 20 minutes', () => {
+    const { rows, horizonSuppressed } = runPredictions(
+      [farOut('t1', '2026-08-01T12:40:00-04:00')], // horizon 2400
+      [],
+      state,
+      T0,
+    );
+    expect(rows).toHaveLength(0);
+    expect(horizonSuppressed).toBe(1);
+  });
+
+  it('treats exactly 1200s as inside and 1201s as outside', () => {
+    const boundary = runPredictions(
+      [farOut('t-in', '2026-08-01T12:20:00-04:00')], // exactly 1200
+      [],
+      state,
+      T0,
+    );
+    expect(boundary.rows).toHaveLength(1);
+    expect(argsOf(boundary.rows[0])[P.horizonSec]).toBe(1200);
+
+    const past = runPredictions(
+      [farOut('t-out', '2026-08-01T12:20:01-04:00')], // 1201
+      [],
+      state,
+      T0,
+    );
+    expect(past.rows).toHaveLength(0);
+  });
+
+  it('always writes predictions with a NULL horizon', () => {
+    // No arrival time at all: a skipped stop, a cancelled trip, a vehicle that
+    // will not serve this stop. Rare, and the interesting failures — the cap must
+    // never swallow them.
+    const { rows, horizonSuppressed } = runPredictions(
+      [prediction({ trip: 'no-arrival', arrival: null })],
+      [],
+      state,
+      T0,
+    );
+    expect(rows).toHaveLength(1);
+    expect(argsOf(rows[0])[P.predictedArrival]).toBeNull();
+    expect(argsOf(rows[0])[P.horizonSec]).toBeNull();
+    expect(horizonSuppressed).toBe(0);
+  });
+
+  it('keeps counting revisions while suppressed, so revision means total revisions', () => {
+    // The load-bearing test for this feature. `revision` is an ML feature meaning
+    // "how many times MBTA revised this arrival" — NOT "how many times since it
+    // entered our window". Those differ, and only the former is useful.
+    const trip = 'long-runner';
+
+    // Three revisions, all far outside the window. Nothing is written.
+    expect(runPredictions([farOut(trip, '2026-08-01T12:40:00-04:00')], [], state, T0).rows).toHaveLength(0);
+    expect(runPredictions([farOut(trip, '2026-08-01T12:41:00-04:00')], [], state, T0 + 60).rows).toHaveLength(0);
+    expect(runPredictions([farOut(trip, '2026-08-01T12:42:00-04:00')], [], state, T0 + 120).rows).toHaveLength(0);
+
+    // Now it enters the window and is revised a fourth time.
+    const inWindow = at('2026-08-01T12:25:00-04:00');
+    const { rows } = runPredictions([farOut(trip, '2026-08-01T12:43:00-04:00')], [], state, inWindow);
+
+    expect(rows).toHaveLength(1);
+    // 4, not 1 — the three suppressed revisions were still counted.
+    expect(argsOf(rows[0])[P.revision]).toBe(4);
+    expect(argsOf(rows[0])[P.horizonSec]).toBe(1080);
+  });
+
+  it('still dedups an unchanged prediction once it enters the window', () => {
+    const trip = 'steady';
+    runPredictions([farOut(trip, '2026-08-01T12:40:00-04:00')], [], state, T0);
+    // Same value, now inside the window. Unchanged is unchanged: no write.
+    const inWindow = at('2026-08-01T12:25:00-04:00');
+    expect(runPredictions([farOut(trip, '2026-08-01T12:40:00-04:00')], [], state, inWindow).rows).toHaveLength(0);
+  });
+
+  it('counts suppressed predictions as seen, so per-slice counts stay truthful', () => {
+    // per_slice_counts answers "is this slice running trains", not "did we write
+    // rows". A suppressed far-out prediction is still evidence of service.
+    const { seen, perSlice, rows } = runPredictions(
+      [farOut('a', '2026-08-01T12:40:00-04:00'), farOut('b', '2026-08-01T12:45:00-04:00')],
+      [],
+      state,
+      T0,
+    );
+    expect(seen).toBe(2);
+    expect(perSlice['place-rugg|Orange|0']).toBe(2);
+    expect(rows).toHaveLength(0);
+  });
+
+  it('keeps a negative horizon, which is inside the window by definition', () => {
+    const late = runPredictions([prediction({ trip: 'overdue' })], [], state, T0 + 420);
+    expect(late.rows).toHaveLength(1);
+    expect(argsOf(late.rows[0])[P.horizonSec]).toBe(-120);
+  });
+});
