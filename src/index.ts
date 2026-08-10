@@ -1,5 +1,6 @@
 import { runTick, type Env } from './collector';
 import { runBackfill, runMatch } from './matcher';
+import { runRollup, shouldRecompute } from './rollup';
 import { buildStatus, DAILY_WRITE_LIMIT } from './status';
 
 /** Must match the second entry in wrangler.toml [triggers] crons. */
@@ -28,6 +29,15 @@ export default {
           by_source: match.by_source,
         });
       }
+      // Rollups ride the matcher cron, gated on LOCAL hour so DST cannot drift
+      // the schedule onto the 03:00 service-date rollover. Runs after the matcher
+      // so the day it summarises is as fully graded as it will get.
+      const nowSec = Math.floor(Date.now() / 1000);
+      if (shouldRecompute(nowSec, Math.floor(nowSec / 60) % 60)) {
+        const roll = await runRollup(env, Date.now());
+        if (roll.error) console.error('rollup failed', roll);
+        else console.log('rollup', roll);
+      }
       return;
     }
 
@@ -45,6 +55,14 @@ export default {
       // 503 when we are stale or over budget, so uptime monitoring can watch the
       // status code alone and never need to parse the body.
       return json(status, status.collecting ? 200 : 503);
+    }
+
+    // Manual rollup recompute, for verifying without waiting for 04:00 local.
+    if (url.pathname === '/rollup' && request.method === 'POST') {
+      if (!env.COLLECT_TOKEN || url.searchParams.get('token') !== env.COLLECT_TOKEN) {
+        return json({ error: 'unauthorized' }, 401);
+      }
+      return json(await runRollup(env, Date.now()));
     }
 
     // Manual full backfill over all collected data, separate from the cron. Resets
@@ -97,6 +115,7 @@ export default {
           'POST /collect?token=',
           'POST /match?token=',
           'POST /backfill?token=',
+          'POST /rollup?token=',
         ],
         daily_write_limit: DAILY_WRITE_LIMIT,
       },

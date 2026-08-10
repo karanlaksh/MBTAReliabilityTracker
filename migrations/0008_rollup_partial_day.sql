@@ -1,0 +1,17 @@
+-- MBTA Reliability Tracker — migration 0008
+--
+-- Mark, rather than silently include, a service date that is not finished.
+--
+-- Why this must be a stored column and not a frontend convention: a partial day
+-- plotted beside complete ones reads as a DIP. Fewer arrivals graded looks
+-- exactly like a drop in service or a change in accuracy — a collection artifact
+-- masquerading as a finding, and the most plausible-looking kind because it
+-- appears at the right-hand edge of every time series where the eye expects the
+-- newest and most interesting data.
+--
+-- Marking is chosen over exclusion so today's data is still queryable, but the
+-- flag travels IN THE ROW so no consumer can render it as complete by omission.
+-- Anything drawing a line through these points must opt in deliberately.
+--
+-- 1 = the service date was still open when this row was computed.
+ALTER TABLE rollup_error_by_day ADD COLUMN is_partial INTEGER NOT NULL DEFAULT 0;

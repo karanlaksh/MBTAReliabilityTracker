@@ -255,12 +255,194 @@ It was caught by checking `actual_arrival_at` against `predicted_arrival` for pl
 rather than by trusting that the run reported no errors — the run reported none, because
 nothing threw.
 
+## Bucket selection: carry-forward, and what it cannot reach
+
+### The flaw in the preliminary summary
+
+The `/status` error summary requires a snapshot whose `horizon_sec` falls *inside* a bucket
+for a trip to contribute to it. Since dedup only writes on change, that means a trip counts
+toward a bucket **only if MBTA revised its prediction while the train was in that horizon
+band**. Churn correlates with delay, so this is a weaker form of the exact sampling bias
+that horizon bucketing exists to eliminate.
+
+Measured, and the direction is confirmed rather than assumed:
+
+| | mean snapshots |
+|---|---:|
+| trips present in all four buckets | 18.7 |
+| trips missing at least one bucket | 9.7 |
+
+**The bias runs against MBTA, not for it.** A suppressed row means the prediction did not
+change; an unchanged prediction correlates with a train running to plan; trains running to
+plan have small errors. So the excluded trips are disproportionately the accurate ones, and
+every pre-carry-forward figure in this README is biased **slightly high** — reporting MBTA
+as marginally worse than it was. Conservative, not flattering. That is the right direction
+for an error to run in, but it is still an error.
+
+### Carry-forward semantics (implemented in the rollup, not as a matcher pass)
+
+For bucket `[L, U)`, the applicable prediction is **the last snapshot written with
+`horizon_sec >= L`** — the value that was on the display when the train was `L` seconds
+away, whether or not a row happened to be written inside the bucket. Predictions persist
+until revised, so a trip with no row in 3-6 is correctly graded on the last row written
+above it.
+
+This lives in the rollup rather than in a second matcher pass. The matcher's job is
+establishing *actual arrival*; which prediction was in effect at a given horizon is a
+question about presentation of the same underlying rows, and answering it at rollup time
+keeps `prediction_snapshots` untouched.
+
+### Measured effect, and the irreducible residual
+
+Aug 3-10, post-cap, n=10,059 arrivals with an actual time:
+
+| bucket | before | after | gain |
+|---|---:|---:|---:|
+| 0-3 | 99.81% | **100.00%** | +0.19pp |
+| 3-6 | 99.52% | **99.85%** | +0.33pp |
+| 6-12 | 99.34% | **99.51%** | +0.17pp |
+| 12-20 | 98.65% | **98.65%** | **+0.00pp** |
+
+Only 0-3 becomes complete. 3-6 and 6-12 improve but do not reach 100%, and **12-20 does not
+improve at all.**
+
+**Why 12-20 cannot be filled: the horizon cap interacting with change-based dedup.** Filling
+a gap in a bucket requires a row from *above* it to carry forward. Above 12-20 is horizon
+>1200s, and the cap means no such row has been written since 2026-08-02. Measured directly:
+**0 of 10,059 arrivals have any snapshot above 1200s.** So the two mechanisms are individually
+sound and jointly leave a hole — the cap removes the rows that carry-forward would need, and
+dedup is why the gap exists in the first place.
+
+The residual in every bucket is the same shape: trips never observed above that bucket's
+lower bound, because the prediction first appeared closer in than the bucket itself.
+
+| blocked bucket | trips | note |
+|---|---:|---|
+| 12-20 | 136 | mean max horizon 436s; **68 are `ADDED`** (unscheduled) trips |
+| 6-12 | 49 | |
+| 3-6 | 15 | |
+
+**Do not reconstruct these from `first_predicted_arrival`.** It records what MBTA first said
+and when we first saw it, but the revisions between first sighting and the first *written*
+row were counted in `revision` and never stored. Interpolating a value for the gap would be
+presenting interpolation as measurement, which is the one thing this project cannot afford
+to do — it is a labelled dataset or it is nothing.
+
+Practical consequence: **the 12-20 bucket has ~1.35% missing coverage that will not improve**,
+and its sample skews very slightly toward revised trips. Report it with that caveat attached,
+or restrict long-horizon analysis to scheduled (non-`ADDED`) trips where coverage is higher.
+
+## Rollups (step 5)
+
+Two tables, both **full recompute**, populated at 04:00 local.
+
+**`rollup_error_by_slice`** — stop x route x direction x weekday x hour x bucket x is_added.
+Bounded cardinality (~11,200 cells) no matter how many days accumulate. Currently 5,834
+cells at a **mean n of 7**, with only 88 cells reaching n>=20 — far too sparse to display.
+Populated now anyway so the schema does not change once it is dense enough to be useful.
+
+**`rollup_error_by_day`** — service_date x stop x route x direction x bucket x is_added,
+~55 rows/day. Exists because table 1 has no date dimension and therefore cannot express a
+before/during/after comparison at all.
+
+Buckets are **single evaluation horizons named for that horizon**: `~1.5 min` (90s),
+`~4.5 min` (270s), `~9 min` (540s), `~16 min` (960s). Not bands — see migration 0007 for why
+the band labels were actively harmful.
+
+**Eligibility defines the denominator:** a (trip, stop) counts toward horizon H only if it
+has any snapshot at `horizon_sec >= H`. That is exactly the population that could have had a
+prediction at H. One rule handles unscheduled `ADDED` trips, which cannot have a
+16-minute-out prediction by construction, *and* the late-entering scheduled trips (49 at
+~9 min, 15 at ~4.5 min) that a rule about `ADDED` would have missed. `is_added` is a
+dimension, never a filter — unscheduled service is inserted during disruption, which is
+exactly the population a diversion comparison is about.
+
+### Staleness policy
+
+**What triggers a recompute, and why that cadence.** One full recompute per day, riding the
+`*/15` matcher cron and gated on `localHour() === 4`. Not a fixed UTC cron: 04:00 local is
+08:00 UTC in summer and 09:00 in winter, so a fixed schedule drifts across DST — and drifts
+onto 03:00 local, the service-date rollover, the worst moment to sample. Not midnight
+either: service dates roll at 03:00 and settlement waits 30 minutes past a trip's last
+predicted arrival, so the previous date is not fully graded until roughly 03:30-04:00. A
+midnight recompute would leave the most recent day partially graded every single time.
+
+**Worst-case staleness of a displayed figure: just under 24 hours.** A figure rendered at
+03:59 local was computed at 04:00 the previous day. Within-day arrivals matched since then
+are absent from the rollups until the next run. This is acceptable because the questions
+these tables answer — typical-week patterns, day-over-day time series — are not questions
+about the last few hours. Anything needing fresher numbers should read `/status`, which
+computes on the fly over a bounded window.
+
+**What happens when the matcher re-matches underneath a row.** The matcher upserts and only
+ever replaces an arrival with higher-confidence evidence, so an arrival's `source`,
+`actual_arrival_at` and `uncertainty_sec` can all improve after a rollup has already
+summarised them. The rollup row is then **wrong until the next recompute** — stale by up to
+24 hours, in the direction of being based on weaker evidence. It self-heals with no
+invalidation logic because every recompute rebuilds from `arrivals` unconditionally. This is
+the main reason for full recompute over incremental patching: an incremental design would
+need to know which cells a re-match touched, which means tracking arrival-to-cell lineage,
+which is strictly more machinery than just recomputing.
+
+**Why full recompute rather than incremental.** Three reasons, in order of weight. (1) The
+re-match case above: correctness comes free rather than requiring lineage tracking.
+(2) Percentiles are not incrementally updatable without retaining the full distribution per
+cell, so an incremental median is not simply harder, it is a different data structure.
+(3) Cardinality is bounded, so the cost does not grow with history — the expensive table is
+capped at ~11,200 cells whether there are 10 days of data or 1,000.
+
+**The write cost, and why daily is affordable but 15-minutely is not.** Measured on a real
+recompute: **6,384 rows** (5,834 slice + 550 day), 5.1 seconds. The `DELETE` before each
+`INSERT` roughly doubles it, since deletes count against the quota too — a full recompute
+must remove cells that no longer have data, which an upsert cannot do. So ~12,800 writes.
+
+| cadence | writes/day | vs the 100,000/day cap |
+|---|---:|---|
+| daily | ~12,800 | 12.8%, on top of the collector's ~40,600 |
+| every 15 min | ~1,228,000 | **12x the entire daily cap** |
+
+That arithmetic settles the cadence rather than asserting it. Even hourly (~307,000) is
+3x over. Daily is the only option that fits, and it happens to match the natural data
+boundary anyway.
+
+**In-progress days are marked, not silently included.** `rollup_error_by_day.is_partial = 1`
+for the open service date. Marking rather than exclusion keeps today queryable, but the flag
+lives **in the row** so no consumer can render it as complete by omission. A partial day
+plotted beside complete ones reads as a dip — a collection artifact that looks like a
+finding, and appears at the right-hand edge where the eye expects the newest data.
+
+## Known issues
+
+**The dataset cannot currently be re-derived from raw snapshots without manual
+intervention.** Two independent causes that compound:
+
+- `POST /backfill` exceeds the Worker CPU limit at current scale. It completed when
+  `prediction_snapshots` held 31k rows; at 258k it needs ~52 passes and dies. The cost is
+  `loadObservations`, which is O(settled x observations) per pass.
+- The confidence guard blocks a rebuild when `source` and `uncertainty_sec` are unchanged.
+  Correct for idempotency, but it means an *estimator* change produces no writes at all —
+  the f=0.5 to f=0.84 turnaround fix required deleting 1,653 rows by hand first.
+
+Together, re-deriving after a matcher change is a manual, multi-step operation. Tolerable at
+this size. **Not tolerable for the November ML work against a ~3M-row table** — fixing the
+O(n*m) join and adding an explicit rebuild path that bypasses the confidence guard is
+required before then, not optional.
+
+**D1 error 7403 occurs spuriously.** Observed 2026-08-02 and 2026-08-10, both times with
+valid auth, correct account, and `d1 (write)` scope present; the identical query succeeded
+seconds later. Retry before debugging credentials.
+
 ## Limitations
 
 Things that are true of the current dataset and would mislead anyone reading a headline
 number without them.
 
-**All collected data so far is weekend data, with the Green Line E branch suspended.**
+**Pre-carry-forward figures are biased slightly high.** See the section above: suppressed
+rows are unchanged predictions, unchanged correlates with on-time, so excluded trips are
+disproportionately accurate ones. Every error figure produced before carry-forward lands
+overstates MBTA's error a little.
+
+**All early data is weekend data, with the Green Line E branch suspended.**
 Collection began 2026-08-01, a Saturday, during the Aug 1–2 Green-E shutdown. Every figure
 in this README is therefore weekend service on Orange and bus 39 only, with two of the ten
 watched slices contributing nothing. Weekday rush hour has denser headways, more crowding,
@@ -285,8 +467,33 @@ reported. `uncertainty_sec = 30` on those rows is an estimate of the magnitude, 
 measurement of it. The bias applies to every bucket roughly equally, so comparisons
 *between* buckets and *between* stops remain sound; only the absolute level is affected.
 
-Related and already handled elsewhere: `stopped_at_turnaround` brackets rather than
-point-estimates precisely to avoid a much larger version of this same bias at termini.
+Related and already handled elsewhere: `stopped_at_turnaround` places its estimate at
+f=0.84 within the bracket precisely to avoid a much larger version of this same bias at
+termini.
+
+### Open question: Forest Hills reads more accurate than mid-line
+
+At ~9 minutes out, Forest Hills (terminus) has a median error of **+17s** against mid-line
+Orange's **+29s**. This is **an open question, not a finding.**
+
+It is counterintuitive. A train reaching the southern terminus has run the entire line and
+accumulated whatever delay the line produced, so the naive expectation is *worse* accuracy
+there, not better.
+
+Candidate explanations, none tested:
+
+- **The final approach is more predictable.** Between Forest Hills and the stop before it
+  there is no branching, no merge, and less opportunity for a train to be held, so the last
+  few minutes may genuinely be easier to forecast than a mid-line segment.
+- **Dwell absorbs variance.** Terminus scheduling has slack built in for turnaround, and a
+  prediction against a padded arrival time is easier to hit.
+- **Residual estimator effects.** f=0.84 was derived from internal structure and validated
+  by a near-zero residual slope (+0.062 s/s, from -0.34), so bracket-width bias is
+  addressed — but that test only rules out bias *correlated with bracket width*. A constant
+  offset would survive it undetected.
+
+Distinguishing these is unfinished work. Until then the number should not be presented as
+evidence that MBTA predicts termini better.
 
 ## Guardrails
 
@@ -548,7 +755,7 @@ push a statement over the limit.
 ## Tests
 
 ```bash
-npm test        # 126 tests
+npm test        # 139 tests
 npm run typecheck
 ```
 
@@ -579,6 +786,9 @@ migrations/0003_write_budget_guardrails.sql  write accounting + error classifica
 migrations/0004_first_seen_and_concurrency.sql  prediction origin, CAS, cap marker
 migrations/0005_matcher.sql           match_key, evidence span
 migrations/0006_plausibility.sql      implausible flag
+migrations/0007_rollups.sql           rollup tables, evaluation-point buckets
+migrations/0008_rollup_partial_day.sql  in-progress day marking
+src/rollup.ts                         step 5: both rollup tables
 src/matcher.ts                        step 4: prediction -> actual arrival
 src/index.ts                          cron entrypoint, /status, /collect
 src/status.ts                         write-budget counter, projection, staleness
