@@ -71,6 +71,34 @@ const TURNAROUND_SEARCH_BEFORE_SEC = 600;
  */
 const IMPLAUSIBLE_DELTA_SEC = 3600;
 
+/**
+ * Where in the turnaround bracket [T1, T2] the true arrival sits.
+ *
+ * actual = T1 + f * (T2 - T1)
+ *
+ * DERIVED FROM INTERNAL STRUCTURE, NOT FITTED TO A TARGET. With an estimator at
+ * weight f_est, the bias in measured error is (f_est - f_true) * span, so
+ * regressing measured error on bracket width recovers f_true without assuming
+ * anything about what terminus error ought to look like.
+ *
+ * Measured with f_est = 0.5 (midpoint) over ~1,300 rows, medians by span band:
+ * +7s (<40s), -4s (40-70s), -15s (70-120s). Slope = -0.34s per second of span,
+ * so f_true = 0.5 + 0.34 = 0.84.
+ *
+ * Deliberately NOT tuned so that Forest Hills matches mid-line stops. Doing that
+ * would assume the answer, and terminus arrival error genuinely may differ from
+ * mid-line. The slope test is trustworthy precisely because it never looks at
+ * another stop.
+ *
+ * Validation is the RESIDUAL slope: re-run the span test at f = 0.84 and it
+ * should be ~0, meaning the estimator no longer varies with bracket width.
+ *
+ * Physically: T2 is MBTA reassigning the vehicle to its next trip, which happens
+ * at or just after arrival; T1 is our last approach sighting, up to a poll
+ * interval earlier. 0.84 puts the estimate near T2 but not on it.
+ */
+const TURNAROUND_ARRIVAL_WEIGHT = 0.84;
+
 export const MATCHER_WATERMARK_KEY = 'matcher_watermark';
 
 /**
@@ -325,7 +353,10 @@ export function resolveArrival(
         const span = Math.max(0, t2 - t1);
         return {
           source: 'stopped_at_turnaround',
-          actual: Math.round((t1 + t2) / 2),
+          actual: Math.round(t1 + TURNAROUND_ARRIVAL_WEIGHT * span),
+          // Still HALF THE SPAN. The point estimate moved within the bracket; the
+          // bracket itself did not narrow, so our uncertainty about where in it
+          // the arrival fell is unchanged.
           uncertainty: Math.max(1, Math.round(span / 2)),
           matchKey: 'stop_id',
           spanSec: span,

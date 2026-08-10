@@ -154,8 +154,10 @@ describe('resolveArrival — terminus turnaround', () => {
   it('brackets between last approach and first reassignment', () => {
     const r = resolveArrival(terminus(), [approach, reassigned], true);
     expect(r.source).toBe('stopped_at_turnaround');
-    expect(r.actual).toBe(T('12:05:00')); // midpoint of 12:04:30 and 12:05:30
-    expect(r.uncertainty).toBe(30); // half of a 60s bracket
+    // T1 + 0.84*span = 12:04:30 + 50s. Weighted toward T2, not centred: the
+    // reassignment is at/just after arrival while T1 is an earlier approach.
+    expect(r.actual).toBe(T('12:05:20'));
+    expect(r.uncertainty).toBe(30); // still half the 60s bracket
     expect(r.spanSec).toBe(60);
   });
 
@@ -174,6 +176,8 @@ describe('resolveArrival — terminus turnaround', () => {
     expect(r.spanSec).toBe(300);
     expect(r.uncertainty).toBe(150);
     expect(r.uncertainty).not.toBe(30);
+    // A wider bracket moves the estimate further from T1, proportionally.
+    expect(r.actual).toBe(T('12:04:30') + 252);
   });
 
   it('falls back to the reassignment time alone with inflated uncertainty', () => {
@@ -330,7 +334,7 @@ describe('turnaround search is anchored (regression)', () => {
   it('ignores an earlier turnaround by the same vehicle on the same day', () => {
     const r = resolveArrival(terminus(), [turnaroundThisMorning, approachNow, turnaroundNow], true);
     expect(r.source).toBe('stopped_at_turnaround');
-    expect(r.actual).toBe(T('18:05:00')); // midpoint of 18:04:30 and 18:05:30
+    expect(r.actual).toBe(T('18:04:30') + 50); // T1 + 0.84*60s
     expect(r.actual).not.toBe(T('06:00:00'));
     expect(r.spanSec).toBe(60);
   });
