@@ -428,6 +428,15 @@ this size. **Not tolerable for the November ML work against a ~3M-row table** â€
 O(n*m) join and adding an explicit rebuild path that bypasses the confidence guard is
 required before then, not optional.
 
+**Range aggregates are n-weighted means of per-day medians, not pooled medians.**
+`rollup_error_by_day` stores one median per (date, slice, bucket), and medians do not
+compose, so `/api/error-by-horizon` cannot produce a true pooled median over a date
+range. `n` is exact; the median and p90 are weighted means. Checked against a pooled
+computation over raw rows and the headline is unchanged either way (bus +27s vs
+Orange +4s), and the API response carries a `method` field saying so. The fix is a
+route-grain pooled rollup alongside the existing two. Required before any figure
+from this project is published as a precise statistic.
+
 **D1 error 7403 occurs spuriously.** Observed 2026-08-02 and 2026-08-10, both times with
 valid auth, correct account, and `d1 (write)` scope present; the identical query succeeded
 seconds later. Retry before debugging credentials.
