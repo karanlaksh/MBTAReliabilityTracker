@@ -1,6 +1,7 @@
 import { runTick, type Env } from './collector';
 import { runBackfill, runMatch } from './matcher';
 import { runRollup, shouldRecompute } from './rollup';
+import { errorByDay, errorByHorizon, summary } from './api';
 import { buildStatus, DAILY_WRITE_LIMIT } from './status';
 
 /** Must match the second entry in wrangler.toml [triggers] crons. */
@@ -47,6 +48,13 @@ export default {
 
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
+
+    // Read-only API for the frontend, served entirely from the rollup tables.
+    // Never from prediction_snapshots: no secondary index, 518k rows now and ~3M
+    // by November.
+    if (url.pathname === '/api/error-by-horizon') return errorByHorizon(env, url);
+    if (url.pathname === '/api/error-by-day') return errorByDay(env, url);
+    if (url.pathname === '/api/summary') return summary(env);
 
     // /status is canonical; /health is kept as an alias so anything already
     // pointing at it keeps working.
@@ -116,6 +124,9 @@ export default {
           'POST /match?token=',
           'POST /backfill?token=',
           'POST /rollup?token=',
+          'GET /api/error-by-horizon',
+          'GET /api/error-by-day',
+          'GET /api/summary',
         ],
         daily_write_limit: DAILY_WRITE_LIMIT,
       },
