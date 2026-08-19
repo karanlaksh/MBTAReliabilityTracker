@@ -434,6 +434,34 @@ seconds later. Retry before debugging credentials.
 
 ## Limitations
 
+<!-- web:limitations:start -->
+- **The Green Line E diversion splits the record.** The E branch was suspended
+  Aug 1-2 and again Aug 8-16, so `place-nuniv` reports zero predictions on those
+  dates. That is real absence of service, not a collection gap. The branch
+  returned Aug 17, so a clean before/during/after comparison is only now becoming
+  possible — with just two post-return weekdays so far it is not yet answerable,
+  and needs a full week of Aug 17+ data before it means anything.
+- **Arrival timestamps carry roughly ±30s of uncertainty.** The collector polls
+  once a minute, and actual arrival is taken from MBTA's own `updated_at` at the
+  observation where a vehicle reports `STOPPED_AT`. That is far tighter than
+  60-second polling alone, but it is still bounded by it. Every `arrivals` row
+  stores its own `uncertainty_sec`; aggregates should not be read as more precise
+  than the measurement underneath them.
+- **At the ~1.5 min point MBTA's prediction is barely a forecast.** At that
+  horizon the train is already visible and often `INCOMING_AT` the platform, so
+  the prediction derives from live vehicle position and is closer to an
+  observation than a forecast. Near-zero error there is not evidence of
+  forecasting skill. The ~9 min and ~16 min points are where forecasting actually
+  happens.
+- **`stopped_at` arrivals skew slightly late.** Actual arrival is the *first*
+  `STOPPED_AT` observation, which is at or after the moment the train physically
+  arrived, never before. The bias is one-directional and applies to all buckets
+  roughly equally, so comparisons between buckets and between stops stay sound;
+  only the absolute level is affected.
+- **Pooled medians are approximated.** Range figures are n-weighted means of
+  per-day medians, because medians do not compose. `n` is exact.
+<!-- web:limitations:end -->
+
 Things that are true of the current dataset and would mislead anyone reading a headline
 number without them.
 

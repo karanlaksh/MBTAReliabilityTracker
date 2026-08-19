@@ -1,0 +1,27 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * Chart roles as custom properties, so hex appears once and marks are written
+ * against roles. Light only: no dark-mode toggle is in scope.
+ */
+:root {
+  --surface-1: #fcfcfb;
+  --surface-2: #f4f4f2;
+  --text-primary: #0b0b0b;
+  --text-secondary: #52514e;
+  --text-muted: #77756e;
+  --rule: #e3e2de;
+  --grid: #eceae5;
+  --zero-line: #8c8a83;
+  --good: #1baf7a;
+  --warning: #eda100;
+  --critical: #e34948;
+}
+
+body {
+  background: var(--surface-1);
+  color: var(--text-primary);
+  -webkit-font-smoothing: antialiased;
+}

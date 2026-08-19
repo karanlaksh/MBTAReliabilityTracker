@@ -1,7 +1,7 @@
 import { runTick, type Env } from './collector';
 import { runBackfill, runMatch } from './matcher';
 import { runRollup, shouldRecompute } from './rollup';
-import { errorByDay, errorByHorizon, summary } from './api';
+import { errorByDay, errorByHorizon, errorBySlice, summary } from './api';
 import { buildStatus, DAILY_WRITE_LIMIT } from './status';
 
 /** Must match the second entry in wrangler.toml [triggers] crons. */
@@ -54,6 +54,7 @@ export default {
     // by November.
     if (url.pathname === '/api/error-by-horizon') return errorByHorizon(env, url);
     if (url.pathname === '/api/error-by-day') return errorByDay(env, url);
+    if (url.pathname === '/api/error-by-slice') return errorBySlice(env, url);
     if (url.pathname === '/api/summary') return summary(env);
 
     // /status is canonical; /health is kept as an alias so anything already
@@ -126,6 +127,7 @@ export default {
           'POST /rollup?token=',
           'GET /api/error-by-horizon',
           'GET /api/error-by-day',
+          'GET /api/error-by-slice',
           'GET /api/summary',
         ],
         daily_write_limit: DAILY_WRITE_LIMIT,

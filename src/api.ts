@@ -315,6 +315,53 @@ export async function summary(env: Env): Promise<Response> {
   });
 }
 
+/**
+ * GET /api/error-by-slice
+ *
+ * The typical-week grid: stop x weekday x hour x bucket. The query exists and is
+ * correct; DISPLAY IS GATED ON SAMPLE SIZE and currently shows nothing, because
+ * mean n per cell is 7 and only ~88 of 6,600 cells reach n>=20. It fills in over
+ * months and turns itself on without a code change.
+ */
+export async function errorBySlice(env: Env, url: URL): Promise<Response> {
+  const minN = Math.max(1, Number(url.searchParams.get('min_n') ?? 20));
+  const { results } = await env.DB.prepare(
+    `SELECT stop_id, route_id, direction_id, weekday, hour, horizon_bucket, is_added,
+            n, median_error_sec, p90_error_sec
+       FROM rollup_error_by_slice
+      WHERE is_added = 0 AND n >= ?
+      ORDER BY n DESC LIMIT 500`,
+  )
+    .bind(minN)
+    .all<Record<string, number | string>>();
+
+  // cells_passing is counted separately, NOT taken from the returned array: the
+  // array is capped at 500 rows, so using its length would report 500 no matter
+  // how sparse the grid really was — and a display gate reading that number would
+  // open as soon as 500 cells qualified, which is 7.6% coverage.
+  const totals = await env.DB.prepare(
+    `SELECT COUNT(*) AS cells, CAST(AVG(n) AS INTEGER) AS mean_n,
+            SUM(CASE WHEN n >= ? AND is_added = 0 THEN 1 ELSE 0 END) AS passing
+       FROM rollup_error_by_slice`,
+  )
+    .bind(minN)
+    .first<{ cells: number; mean_n: number; passing: number }>();
+
+  const cellsTotal = Number(totals?.cells ?? 0);
+  const passing = Number(totals?.passing ?? 0);
+
+  return jsonResponse({
+    min_n: minN,
+    cells_total: cellsTotal,
+    mean_n_per_cell: Number(totals?.mean_n ?? 0),
+    cells_passing: passing,
+    // The gate the client applies: what fraction of the grid is actually usable.
+    coverage: cellsTotal > 0 ? Number((passing / cellsTotal).toFixed(4)) : 0,
+    note: 'display is gated on coverage and mean n; too sparse to render until months accumulate',
+    cells: results ?? [],
+  });
+}
+
 function round1(v: unknown): number | null {
   if (v === null || v === undefined) return null;
   const n = Number(v);
