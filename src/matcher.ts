@@ -131,6 +131,8 @@ export interface MatchStats {
    * amount of that overlap.
    */
   upserts_attempted: number;
+  /** arrival_counts rows deleted + inserted. Writes, so they count against budget. */
+  count_rows_written: number;
   implausible: number;
   by_source: Record<string, number>;
   turnaround_spans: number[];
@@ -432,6 +434,7 @@ export async function runMatch(
     settled: 0,
     unsettled: 0,
     upserts_attempted: 0,
+    count_rows_written: 0,
     implausible: 0,
     by_source: {},
     turnaround_spans: [],
@@ -556,6 +559,23 @@ export async function runMatch(
         await env.DB.batch(upserts.slice(i, i + 50));
       }
       stats.upserts_attempted = upserts.length;
+      // Hourly on the schedule, not every run: each refresh re-reads a day's
+      // arrivals (~5-10k rows), ~0.5-1M reads/day at 96 runs for a footer figure.
+      // Because it recomputes whole dates rather than applying deltas, the hourly
+      // run also covers what the previous three wrote — provided it refreshes
+      // every date they could have touched, hence today AND yesterday: the runs
+      // just after the 03:00 rollover settle the previous date's last trips.
+      // A backfill (opts.full) writes arbitrary old dates, so it refreshes what
+      // it wrote on every pass.
+      const hourly = Math.floor(now / 60) % 60 < 15;
+      if (hourly || opts.full) {
+        const dates = new Set(settled.map((c) => c.service_date));
+        if (hourly) {
+          dates.add(serviceDate(now));
+          dates.add(serviceDate(now - 86_400));
+        }
+        stats.count_rows_written = await refreshArrivalCounts(env.DB, [...dates]);
+      }
     }
 
     const lastScanned = rows[rows.length - 1].id;
@@ -623,6 +643,33 @@ function observationQueries(dates: string[]): { sql: string; binds: string[] }[]
     });
   }
   return out;
+}
+
+/**
+ * Recompute arrival_counts for the service dates this run wrote.
+ *
+ * Reads only those dates, through the arrivals UNIQUE (service_date, ...) index.
+ * DELETE + INSERT in one batch, which D1 runs as a transaction, so /api/summary
+ * never sees a date with its counts removed and not yet replaced. Recompute
+ * rather than increment: an upsert that upgrades a row's source moves a count
+ * from one source to another, which an increment would get silently wrong.
+ */
+async function refreshArrivalCounts(db: D1Database, dates: string[]): Promise<number> {
+  if (dates.length === 0) return 0;
+  const inList = dates.map(() => '?').join(',');
+  const [del, ins] = await db.batch([
+    db.prepare(`DELETE FROM arrival_counts WHERE service_date IN (${inList})`).bind(...dates),
+    db
+      .prepare(
+        `INSERT INTO arrival_counts (service_date, stop_id, route_id, direction_id, source, n)
+         SELECT service_date, stop_id, COALESCE(route_id, ''), COALESCE(direction_id, -1),
+                source, COUNT(*)
+           FROM arrivals WHERE service_date IN (${inList})
+          GROUP BY 1, 2, 3, 4, 5`,
+      )
+      .bind(...dates),
+  ]);
+  return (del.meta?.changes ?? 0) + (ins.meta?.changes ?? 0);
 }
 
 /**

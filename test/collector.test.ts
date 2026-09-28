@@ -550,3 +550,17 @@ describe('near-target sequence rule (the bus fix)', () => {
     expect(past.rows).toHaveLength(1);
   });
 });
+
+describe('shouldPrune', () => {
+  const { shouldPrune } = __test;
+  const at = (iso: string) => Math.floor(Date.parse(iso) / 1000);
+
+  it('runs every hour at :07, not once a day', () => {
+    // The daily 04:07-local prune fell inside the exhausted-read window every day
+    // from 2026-09-02, so it never ran. Hourly bounds the damage of any one miss.
+    expect(shouldPrune(at('2026-09-29T08:07:00Z'))).toBe(true);
+    expect(shouldPrune(at('2026-09-29T15:07:30Z'))).toBe(true);
+    expect(shouldPrune(at('2026-09-29T15:08:00Z'))).toBe(false);
+    expect(shouldPrune(at('2026-09-29T15:06:59Z'))).toBe(false);
+  });
+});

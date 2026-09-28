@@ -4,7 +4,11 @@
 // in today's 5M-row read budget. /status uses it too.
 
 import type { Env } from './collector';
-import { utcDayStart } from './status';
+
+/** 00:00 UTC of the day containing `now`: the D1 quota day. */
+function utcDayStart(now: number): number {
+  return Math.floor(now / 86_400) * 86_400;
+}
 
 export interface AccountUsage {
   rows_read_today: number;

@@ -11,9 +11,29 @@
 // misreport the budget by 4-5 hours of writes every single day.
 
 import type { Env } from './collector';
+import { serviceDate } from './service-date';
+import { fetchAccountUsage, type AccountUsage } from './usage';
 
 /** D1 free tier, rows written per UTC day. */
 export const DAILY_WRITE_LIMIT = 100_000;
+
+/**
+ * D1 free tier, rows read per UTC day, ACCOUNT-WIDE.
+ *
+ * The one that actually failed. From at least 2026-09-02 to 2026-09-28 it was
+ * exhausted by ~05:30-06:30 UTC every day and the collector lost ~18 hours of
+ * data a day, while this endpoint watched only writes. See migration 0009.
+ */
+export const DAILY_READ_LIMIT = 5_000_000;
+
+/**
+ * collector_runs has no index on started_at. Ticks are one a minute and ids only
+ * increase, so the last N ids bound a time window without paying for one. The
+ * started_at filter still applies inside the bound, so the only failure mode is
+ * undercounting if a window held more than N runs — 1,440/day plus the odd
+ * manual or concurrent tick is well inside these margins.
+ */
+const RUNS_PER_UTC_DAY_BOUND = 2_000;
 
 /** Fractions of the daily limit at which the reported level changes. */
 const WARN_AT = 0.7;
@@ -55,6 +75,7 @@ export function project(
   writesToday: number,
   writesLastHour: number,
   now: number,
+  limit: number = DAILY_WRITE_LIMIT,
 ): {
   projected_eod: number;
   projected_by_recent_rate: number;
@@ -75,7 +96,39 @@ export function project(
     projected_eod: projected,
     projected_by_recent_rate: byRecent,
     projected_by_flat_rate: byFlat,
-    level: level(projected / DAILY_WRITE_LIMIT),
+    level: level(projected / limit),
+  };
+}
+
+/**
+ * The read-budget block of /status. Same projection and thresholds as writes.
+ *
+ * When usage cannot be fetched the level is 'unknown', never 'ok'. An absent
+ * counter reading as healthy is how this ran unnoticed for four weeks.
+ */
+export function readBudget(
+  usage: AccountUsage | null,
+  usageError: string | null,
+  now: number,
+): Record<string, unknown> {
+  const dayStart = utcDayStart(now);
+  const reset = { utc_day_start: dayStart, seconds_until_reset: dayStart + DAY_SEC - now };
+  if (!usage) {
+    return { limit: DAILY_READ_LIMIT, level: 'unknown', error: usageError, ...reset };
+  }
+  const used = usage.rows_read_today;
+  const projection = project(used, usage.rows_read_last_hour, now, DAILY_READ_LIMIT);
+  return {
+    limit: DAILY_READ_LIMIT,
+    source: 'cloudflare_graphql_account_total',
+    used_today: used,
+    remaining: Math.max(0, DAILY_READ_LIMIT - used),
+    pct_used: Number(((100 * used) / DAILY_READ_LIMIT).toFixed(1)),
+    pct_projected: Number(((100 * projection.projected_eod) / DAILY_READ_LIMIT).toFixed(1)),
+    ...projection,
+    reads_last_hour: usage.rows_read_last_hour,
+    exhausted: used >= DAILY_READ_LIMIT,
+    ...reset,
   };
 }
 
@@ -101,15 +154,21 @@ interface RunRow {
 const ROWS_WRITTEN_SQL =
   'COALESCE(rows_written, snapshots_written + vehicle_rows_written + 2)';
 
-async function arrivalsSummary(env: Env, since: number) {
+/**
+ * Bounded by service_date, not matched_at. Nothing indexes matched_at, so the old
+ * `matched_at >= ?` filter read the whole arrivals table on every call. The
+ * UNIQUE (service_date, trip_id, stop_id) index makes a service_date range a
+ * real range read.
+ */
+async function arrivalsSummary(env: Env, sinceServiceDate: string) {
   const { results } = await env.DB.prepare(
     `SELECT source, COUNT(*) AS n,
             SUM(CASE WHEN actual_arrival_at IS NULL THEN 1 ELSE 0 END) AS without_time,
             SUM(implausible) AS implausible,
             CAST(AVG(uncertainty_sec) AS INTEGER) AS mean_uncertainty_sec
-       FROM arrivals WHERE matched_at >= ? GROUP BY source ORDER BY n DESC`,
+       FROM arrivals WHERE service_date >= ? GROUP BY source ORDER BY n DESC`,
   )
-    .bind(since)
+    .bind(sinceServiceDate)
     .all<{
       source: string;
       n: number;
@@ -121,6 +180,49 @@ async function arrivalsSummary(env: Env, since: number) {
 }
 
 export async function buildStatus(env: Env, now: number): Promise<Record<string, unknown>> {
+  // Fetched from Cloudflare, not D1, and BEFORE touching D1: when the read
+  // budget is exhausted every D1 query below fails, and this block is the one
+  // thing that can still say why.
+  let usage: AccountUsage | null = null;
+  let usageError: string | null = null;
+  try {
+    usage = await fetchAccountUsage(env, now);
+  } catch (err) {
+    usageError = err instanceof Error ? err.message : String(err);
+  }
+  const reads = readBudget(usage, usageError, now);
+
+  let d1: Record<string, unknown>;
+  try {
+    d1 = await buildD1Status(env, now);
+  } catch (err) {
+    // Previously an uncaught 500 with no explanation. Now a 503 that names D1.
+    return {
+      collecting: false,
+      d1_error: err instanceof Error ? err.message : String(err),
+      read_budget: reads,
+      now,
+    };
+  }
+
+  const writeBudget = d1.write_budget as Record<string, unknown>;
+  return {
+    ...d1,
+    // Exhausted reads refuse the collector's dedup-state read, so nothing new is
+    // stored even though collector_runs rows still land (they are writes).
+    collecting: Boolean(d1.collecting) && reads.exhausted !== true,
+    write_budget: {
+      ...writeBudget,
+      // Cloudflare's account total beside our own count. Ours only sees what the
+      // collector reports about itself; a gap between the two is unaccounted
+      // writes (matcher, rollup, manual queries).
+      account_reported_today: usage?.rows_written_today ?? null,
+    },
+    read_budget: reads,
+  };
+}
+
+async function buildD1Status(env: Env, now: number): Promise<Record<string, unknown>> {
   const dayStart = utcDayStart(now);
 
   const [last, today, hour, failures] = await Promise.all([
@@ -138,7 +240,9 @@ export async function buildStatus(env: Env, now: number): Promise<Record<string,
               SUM(CASE WHEN error IS NOT NULL THEN 1 ELSE 0 END) AS failed,
               COALESCE(SUM(concurrent_tick), 0) AS concurrent,
               MAX(CASE WHEN concurrent_tick = 1 THEN started_at END) AS last_concurrent_at
-         FROM collector_runs WHERE started_at >= ?`,
+         FROM collector_runs
+        WHERE id > (SELECT MAX(id) FROM collector_runs) - ${RUNS_PER_UTC_DAY_BOUND}
+          AND started_at >= ?`,
     )
       .bind(dayStart)
       .first<{
@@ -152,7 +256,9 @@ export async function buildStatus(env: Env, now: number): Promise<Record<string,
 
     env.DB.prepare(
       `SELECT COALESCE(SUM(${ROWS_WRITTEN_SQL}), 0) AS writes, COUNT(*) AS runs
-         FROM collector_runs WHERE started_at >= ?`,
+         FROM collector_runs
+        WHERE id > (SELECT MAX(id) FROM collector_runs) - ${RUNS_PER_UTC_DAY_BOUND}
+          AND started_at >= ?`,
     )
       .bind(Math.max(dayStart, now - 3600))
       .first<{ writes: number; runs: number }>(),
@@ -162,15 +268,17 @@ export async function buildStatus(env: Env, now: number): Promise<Record<string,
     env.DB.prepare(
       `SELECT error_kind, COUNT(*) AS n, MAX(started_at) AS last_at
          FROM collector_runs
-        WHERE started_at >= ? AND error_kind IS NOT NULL
+        WHERE id > (SELECT MAX(id) FROM collector_runs) - ${RUNS_PER_UTC_DAY_BOUND}
+          AND started_at >= ? AND error_kind IS NOT NULL
         GROUP BY error_kind ORDER BY n DESC`,
     )
       .bind(dayStart)
       .all<{ error_kind: string; n: number; last_at: number }>(),
   ]);
 
-  // Bounded window for the derived summaries: 48h of matched arrivals.
-  const summarySince = now - 172_800;
+  // Bounded window for the derived summaries: the last three service dates
+  // (today's open one plus the two before it), roughly the old 48h of matches.
+  const summarySince = serviceDate(now - 172_800);
   const bySource = await arrivalsSummary(env, summarySince);
 
   // Unfulfilled = a prediction that never produced an arrival. 'skipped' and
@@ -261,7 +369,7 @@ export async function buildStatus(env: Env, now: number): Promise<Record<string,
     // A median error that quietly excludes the trains that never came is
     // systematically optimistic, and optimistic in exactly the cases that matter.
     matching: {
-      window_hours: 48,
+      window_since_service_date: summarySince,
       arrivals_by_source: bySource,
       graded_predictions: graded,
       unfulfilled,

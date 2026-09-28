@@ -35,6 +35,7 @@ export default {
           scanned: match.scanned_rows,
           settled: match.settled,
           upserts_attempted: match.upserts_attempted,
+          count_rows_written: match.count_rows_written,
           implausible: match.implausible,
           by_source: match.by_source,
         });

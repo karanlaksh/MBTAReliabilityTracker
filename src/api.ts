@@ -13,6 +13,7 @@
 // not the same statistic, so the field carries a `method` label saying so. The fix
 // is a route-grain pooled rollup, which is out of scope here.
 
+import { SLICE_WINDOW_DAYS } from './rollup';
 import type { Env } from './collector';
 
 /** Rollups recompute once daily at 04:00 local, so a 30-minute cache is generous. */
@@ -222,15 +223,29 @@ export async function errorByDay(env: Env, url: URL): Promise<Response> {
  * as "no service" and not as a broken collector — which is what a flat line at
  * zero looks like.
  */
+/**
+ * collector_runs has no index on started_at; ids only increase and ticks are one
+ * a minute, so the last N ids bound the 7-day window the frontend labels this
+ * as. Without it, the count covered every row ever retained — and the 04:07
+ * local prune had been failing on the exhausted read budget, so that was every
+ * run since 2026-09-01. 7 x 1,440 = 10,080; the margin absorbs manual and
+ * concurrent ticks.
+ */
+const RUNS_7D_BOUND = 12_000;
+
 export async function summary(env: Env): Promise<Response> {
   const [span, bySource, slices, alerts, runs] = await Promise.all([
+    // All three arrival aggregates read arrival_counts (~30 rows per service
+    // date), not arrivals. They used to aggregate the whole arrivals table three
+    // times per call — ~136k rows each, growing forever — on a page that
+    // revalidates every 30 minutes. See migration 0010.
     env.DB.prepare(
       `SELECT MIN(service_date) AS since, MAX(service_date) AS until,
-              COUNT(*) AS arrivals FROM arrivals`,
+              COALESCE(SUM(n), 0) AS arrivals FROM arrival_counts`,
     ).first<Record<string, string | number>>(),
 
     env.DB.prepare(
-      'SELECT source, COUNT(*) AS n FROM arrivals GROUP BY source ORDER BY n DESC',
+      'SELECT source, SUM(n) AS n FROM arrival_counts GROUP BY source ORDER BY n DESC',
     ).all<{ source: string; n: number }>(),
 
     env.DB.prepare(
@@ -239,9 +254,9 @@ export async function summary(env: Env): Promise<Response> {
               COALESCE(a.recent, 0) AS arrivals_last_7d
          FROM watched_stops w
          LEFT JOIN (
-           SELECT stop_id, route_id, direction_id, COUNT(*) AS n,
-                  SUM(CASE WHEN service_date >= date('now','-7 day') THEN 1 ELSE 0 END) AS recent
-             FROM arrivals GROUP BY 1,2,3
+           SELECT stop_id, route_id, direction_id, SUM(n) AS n,
+                  SUM(CASE WHEN service_date >= date('now','-7 day') THEN n ELSE 0 END) AS recent
+             FROM arrival_counts GROUP BY 1,2,3
          ) a ON a.stop_id=w.stop_id AND a.route_id=w.route_id AND a.direction_id=w.direction_id
         WHERE w.active = 1
         ORDER BY w.mode, w.route_id, w.stop_id, w.direction_id`,
@@ -261,7 +276,9 @@ export async function summary(env: Env): Promise<Response> {
               SUM(CASE WHEN error IS NOT NULL THEN 1 ELSE 0 END) AS failed,
               COALESCE(SUM(concurrent_tick),0) AS concurrent,
               MAX(started_at) AS last_run
-         FROM collector_runs`,
+         FROM collector_runs
+        WHERE id > (SELECT MAX(id) FROM collector_runs) - ${RUNS_7D_BOUND}
+          AND started_at >= strftime('%s','now') - ${7 * 86_400}`,
     ).first<Record<string, number>>(),
   ]);
 
@@ -357,7 +374,13 @@ export async function errorBySlice(env: Env, url: URL): Promise<Response> {
     cells_passing: passing,
     // The gate the client applies: what fraction of the grid is actually usable.
     coverage: cellsTotal > 0 ? Number((passing / cellsTotal).toFixed(4)) : 0,
-    note: 'display is gated on coverage and mean n; too sparse to render until months accumulate',
+    // The grid covers a rolling window, not all history: recomputing it over
+    // all history read ~10-15M rows (measured), 2-3x the 5M/day budget. A 7-day
+    // window cannot reach the display gate below, so the grid stays hidden
+    // until it is rebuilt on a composable store. Stated here so no consumer
+    // can present it as all-time.
+    window_days: SLICE_WINDOW_DAYS,
+    note: `rolling ${SLICE_WINDOW_DAYS}-day window, not all history; display is gated on coverage and mean n`,
     cells: results ?? [],
   });
 }

@@ -18,7 +18,7 @@ import {
   relId,
   type Document,
 } from './mbta';
-import { localHour, serviceDate } from './service-date';
+import { serviceDate } from './service-date';
 import { claimState, loadState, pruneState, releaseState, type DedupState } from './state';
 
 export interface Env {
@@ -459,10 +459,7 @@ export async function runTick(env: Env, startedAtMs: number): Promise<RunRecord>
 
     if (shouldPrune(observedAt)) {
       // Deletes count against the write quota exactly like inserts do.
-      const pruned = await env.DB.prepare('DELETE FROM collector_runs WHERE started_at < ?')
-        .bind(observedAt - RUN_RETENTION_SEC)
-        .run();
-      run.rows_written += pruned.meta?.changes ?? 0;
+      run.rows_written += await pruneRuns(env.DB, observedAt - RUN_RETENTION_SEC);
     }
   } catch (err) {
     run.error = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
@@ -913,9 +910,61 @@ function alertAffectsWatched(
 
 // --- helpers ----------------------------------------------------------------
 
-/** Once a day, at 04:07 local — outside the 03:00 service-date rollover. */
+/**
+ * Every hour at :07, in bounded chunks.
+ *
+ * It used to run once a day at 04:07 local, deleting everything past retention
+ * in one statement. From 2026-09-02 that minute always fell after the read
+ * budget was exhausted, so it never ran: collector_runs held every run since
+ * 2026-09-01 while the frontend labelled the count "7 days". Hourly means one
+ * failed minute costs an hour of pruning, not a day; the chunk bounds what any
+ * single run can cost after a backlog.
+ */
 function shouldPrune(observedAt: number): boolean {
-  return localHour(observedAt) === 4 && Math.floor(observedAt / 60) % 60 === 7;
+  return Math.floor(observedAt / 60) % 60 === 7;
+}
+
+/**
+ * Oldest runs considered per prune. 24 prunes/day x 500 = 12,000/day against an
+ * inflow of 1,440/day clears the ~29k backlog left by the outage in about three
+ * days, at ~12k writes/day meanwhile. Larger chunks clear it faster but put the
+ * first days after the fix close to the write warn level. Reads ~1,000/prune.
+ */
+const PRUNE_CHUNK = 500;
+
+/**
+ * Fold the oldest expired runs into collection_coverage, then delete them.
+ *
+ * READ COST IS BOUNDED BY THE CHUNK, NOT THE TABLE. started_at has no index, so
+ * `WHERE started_at < ?` alone would scan the whole table once nothing is left
+ * to delete. Ids increase with time, so expired runs are always the lowest ids:
+ * take the first PRUNE_CHUNK by id (a rowid range read) and filter those.
+ *
+ * Coverage first, in the same batch — one transaction — so every deleted run is
+ * counted exactly once. collector_runs plus collection_coverage always hold the
+ * complete history. Returns rows written (coverage upserts + deletes).
+ */
+async function pruneRuns(db: D1Database, cutoff: number): Promise<number> {
+  const expired = `SELECT id FROM (SELECT id, started_at FROM collector_runs ORDER BY id LIMIT ${PRUNE_CHUNK})
+                    WHERE started_at < ?`;
+  const [coverage, deleted] = await db.batch([
+    db
+      .prepare(
+        `INSERT INTO collection_coverage (hour_start, runs, ok_runs, d1_limit_runs)
+         SELECT (started_at / 3600) * 3600, COUNT(*),
+                SUM(CASE WHEN error IS NULL THEN 1 ELSE 0 END),
+                SUM(CASE WHEN error_kind = 'd1_limit' THEN 1 ELSE 0 END)
+           FROM collector_runs WHERE id IN (${expired})
+          GROUP BY 1
+         ON CONFLICT (hour_start) DO UPDATE SET
+           runs          = runs + excluded.runs,
+           ok_runs       = ok_runs + excluded.ok_runs,
+           d1_limit_runs = d1_limit_runs + excluded.d1_limit_runs`,
+      )
+      .bind(cutoff),
+    db.prepare(`DELETE FROM collector_runs WHERE id IN (${expired})`).bind(cutoff),
+  ]);
+  return (coverage.meta?.changes ?? 0) + (deleted.meta?.changes ?? 0);
 }
 
 function unique(values: string[]): string[] {
@@ -931,4 +980,5 @@ export const __test = {
   selectPeriod,
   alertAffectsWatched,
   shouldPrune,
+  pruneRuns,
 };
