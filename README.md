@@ -21,6 +21,54 @@ Design rationale lives in [CLAUDE.md](CLAUDE.md). This file covers running it.
 | 4. Matching logic | done, deployed, running on `*/15` |
 | 5. Rollups + dashboard | not started |
 
+## Incident: the read-budget outage, 2026-09-01 to 2026-09-28
+
+**For four weeks the collector stored data only in the evening.** D1's free-tier read
+limit (5,000,000 rows/day, account-wide, reset at 00:00 UTC = 20:00 ET) ran out every
+night, after which D1 refused every query until the next reset. Each day's collection
+therefore ran from 20:00 ET until the budget was gone: about 02:15–04:30 ET in the first
+week of September, about 01:30 ET by the end, as the table grew. It first cut in at 16:01
+ET on Sept 1. Every rush hour in the window is missing and cannot be recovered — MBTA
+predictions are ephemeral.
+
+| | |
+|---|---|
+| Cause | One matcher query, `vehicle_observations WHERE service_date IN (?)`, on a table with no index. The filter narrowed the result, not the scan: ~237k rows read per run, 96 runs/day. |
+| How it was found | `wrangler d1 insights` over 7 days: that one query was 29.2M of 32.2M rows read (91%). The error text in `collector_runs` said *"exceeded D1's free tier daily row read limit"*. |
+| Fix | Migration 0009: a **partial index** on `vehicle_observations(service_date)`, from 2026-09-27 — partial because building a full index would have cost more writes than a day's budget. The same audit found the rollup reading ~20–30M rows per run and `/api/summary` scanning `arrivals` in full; both are bounded now (migration 0010, *Rollups → Read cost*). |
+| Data | September is not summarised. Rollups start at **2026-09-28**. `rollup_error_by_day` rows through 2026-09-08 were computed before the rewrite and kept; Sept 1–8 among them are partial days. |
+
+**The instrumentation gap is the real lesson, more than the index.**
+
+- **The run count looked healthy the whole time.** `collector_runs` showed ~1,440 runs every
+  day while ~1,100 of them stored nothing. The read limit refuses reads, not writes, and the
+  run row is a write — so it always landed. "Runs per day" proves the cron fires, nothing
+  more.
+- **The failures were recorded, but as a symptom with no cause.** Every refused run carried
+  `error_kind = 'd1_limit'`, and `/status` went 503 on the first one each day. But that label
+  and its docs said *"D1 refused the write"*, the write guardrail — the only budget
+  `/status` tracked — was fine (~12k/day actual), and nothing measured reads at all. There
+  was a symptom to see and nothing that explained it or warned in advance.
+- **`d1_limit` counts undercount outages by construction.** When D1 refuses *writes*, the row
+  that would record the failure is refused with it (Guardrails §3). This outage happened to
+  be the countable kind; the next may not be. A zero is not evidence of health.
+- **The matcher and the rollup reported failures only to the console.** Neither writes to
+  `collector_runs`, so `/status` could not show them. The rollup failed every day at 04:00 ET;
+  its DELETE-then-INSERT left `rollup_error_by_slice` **empty** and `rollup_error_by_day`
+  stuck at 2026-09-08. The 04:07 prune of `collector_runs` failed the same way, so the
+  "7 days" of retained runs was every run since Sept 1. The prune now runs hourly in
+  500-row chunks and first folds each run into `collection_coverage` (per UTC hour: runs,
+  ok runs, `d1_limit` runs), so this outage's record survives as hourly counts.
+- **An estimate stood in for a measurement.** This README said matcher reads were "roughly
+  400k/day". It counted the `prediction_snapshots` side and missed the vehicle side, ~50x
+  larger, and was never checked against Cloudflare's own metrics.
+
+What closes the gap is a **read counter on `/status` taken from Cloudflare's account-wide
+analytics** rather than our own counts (Guardrails §4). It sees every reader — matcher,
+rollup, API, ad-hoc `wrangler` queries — and still answers while D1 is refusing queries. One
+ad-hoc `MAX()` over `prediction_snapshots` during the investigation read 962k rows on its
+own; a self-reported counter would never have seen it.
+
 ## What the collector does
 
 Once a minute:
@@ -236,10 +284,16 @@ rather than written off.
 A (trip, stop) is judged only once its last predicted arrival is 30 minutes past.
 
 Measured cost per run: ~11 arrivals written plus 1 watermark, ~1,150 writes/day against the
-collector's ~33,000. Reads are the larger share at roughly 400k/day against 5M.
+collector's ~33,000. ~~Reads are the larger share at roughly 400k/day against 5M.~~ **Wrong,
+and the cause of the read-budget outage above**: that estimate left out
+`loadObservations`, which read all of `vehicle_observations` (~237k rows) on every run —
+~22M/day wanted against a 5M limit. Fixed by migration 0009. Post-fix reads/day are
+recorded under Guardrails §4 once a full day has been measured.
 
 `POST /backfill?token=` runs a full pass over all collected data, separate from the cron.
-Safe at any time: every write is confidence-guarded.
+Safe for the data at any time — every write is confidence-guarded — but **not for the read
+budget**: each pass over a date before the partial index floor (2026-09-27) scans all of
+`vehicle_observations`, ~237k rows a pass.
 
 ### A bug this shipped with, and how it was caught
 
@@ -334,7 +388,16 @@ or restrict long-horizon analysis to scheduled (non-`ADDED`) trips where coverag
 
 ## Rollups (step 5)
 
-Two tables, both **full recompute**, populated at 04:00 local.
+Two tables, both **recomputed rather than patched, over bounded ranges**, at 04:00 local:
+`rollup_error_by_day` for the open service date and the two before it, and
+`rollup_error_by_slice` over a rolling **7-day window**. Until 2026-09-28 both were
+recomputed over all history, which is what made them unaffordable — see *Read cost*
+below and the incident section.
+
+**Nothing before 2026-09-28 is ever recomputed** (`ROLLUP_FLOOR` in `src/rollup.ts`). The
+September dates are degraded and not summarised; the pre-rewrite `rollup_error_by_day` rows
+through 2026-09-08 are left exactly as they are. `POST /rollup?date=YYYY-MM-DD` recomputes one
+date on request and refuses dates before the floor.
 
 **`rollup_error_by_slice`** — stop x route x direction x weekday x hour x bucket x is_added.
 Bounded cardinality (~11,200 cells) no matter how many days accumulate. Currently 5,834
@@ -359,8 +422,9 @@ exactly the population a diversion comparison is about.
 
 ### Staleness policy
 
-**What triggers a recompute, and why that cadence.** One full recompute per day, riding the
-`*/15` matcher cron and gated on `localHour() === 4`. Not a fixed UTC cron: 04:00 local is
+**What triggers a recompute, and why that cadence.** One bounded recompute per day, riding
+the `*/15` matcher cron, gated on `localHour() === 4` and on the account having read at most
+1.5M rows so far that UTC day. Not a fixed UTC cron: 04:00 local is
 08:00 UTC in summer and 09:00 in winter, so a fixed schedule drifts across DST — and drifts
 onto 03:00 local, the service-date rollover, the worst moment to sample. Not midnight
 either: service dates roll at 03:00 and settlement waits 30 minutes past a trip's last
@@ -379,7 +443,10 @@ ever replaces an arrival with higher-confidence evidence, so an arrival's `sourc
 `actual_arrival_at` and `uncertainty_sec` can all improve after a rollup has already
 summarised them. The rollup row is then **wrong until the next recompute** — stale by up to
 24 hours, in the direction of being based on weaker evidence. It self-heals with no
-invalidation logic because every recompute rebuilds from `arrivals` unconditionally. This is
+invalidation logic because every recompute rebuilds its window from `arrivals`
+unconditionally — **within that window**: the last three service dates for
+`rollup_error_by_day`, seven for the grid. A re-match of an older date, which only a manual
+`/backfill` produces, is not picked up until `POST /rollup?date=` is run for it. This is
 the main reason for full recompute over incremental patching: an incremental design would
 need to know which cells a re-match touched, which means tracking arrival-to-cell lineage,
 which is strictly more machinery than just recomputing.
@@ -388,13 +455,18 @@ which is strictly more machinery than just recomputing.
 re-match case above: correctness comes free rather than requiring lineage tracking.
 (2) Percentiles are not incrementally updatable without retaining the full distribution per
 cell, so an incremental median is not simply harder, it is a different data structure.
-(3) Cardinality is bounded, so the cost does not grow with history — the expensive table is
-capped at ~11,200 cells whether there are 10 days of data or 1,000.
+(3) ~~Cardinality is bounded, so the cost does not grow with history.~~ **True of writes,
+false of reads, and the reads are what failed.** The output is capped at ~11,200 cells, but
+computing it read all of `prediction_snapshots` 8 times per run: 1.4M–3.8M rows per
+statement, measured, and growing daily. Recompute is still the design; recomputing *all
+history* is what was dropped.
 
 **The write cost, and why daily is affordable but 15-minutely is not.** Measured on a real
 recompute: **6,384 rows** (5,834 slice + 550 day), 5.1 seconds. The `DELETE` before each
 `INSERT` roughly doubles it, since deletes count against the quota too — a full recompute
 must remove cells that no longer have data, which an upsert cannot do. So ~12,800 writes.
+Since the bounded rewrite a run inserts less — measured locally with a full 7-day window,
+72 day rows + 3,696 grid rows — so ~7,500 writes a day including the deletes.
 
 | cadence | writes/day | vs the 100,000/day cap |
 |---|---:|---|
@@ -404,6 +476,59 @@ must remove cells that no longer have data, which an upsert cannot do. So ~12,80
 That arithmetic settles the cadence rather than asserting it. Even hourly (~307,000) is
 3x over. Daily is the only option that fits, and it happens to match the natural data
 boundary anyway.
+
+### Read cost
+
+The constraint that decides this design is D1's **5,000,000 rows read/day**, not writes.
+
+**Bounded by rowid, not by an index — chosen over a partial index on purpose.** Every snapshot's `service_date` is
+`serviceDate(tick time)` and ticks append in order, so each service date is one contiguous
+id range. A binary search over rowid finds it in ~20 one-row probes. A partial index on
+`prediction_snapshots(service_date)` would bound the read equally well but costs an index
+row on every future snapshot write — +28–34k writes/day on a table that is already most of
+the write budget, putting a normal weekday near the 90% critical line. The rowid range
+costs nothing to write.
+
+**One pass for all four buckets.** The carry-forward pick for each bucket is
+`MIN(horizon_sec * 1e10 + predicted_arrival)` over one `GROUP BY (trip, stop)`, rather than
+four joins each ranked with `ROW_NUMBER()`. Window functions sort through temp b-trees that
+D1 bills as reads, and SQLite re-ran the join once per bucket unless the grouped CTE is
+`MATERIALIZED`.
+
+Measured locally at production scale (960k snapshots, ~30k per service date), with D1's own
+`rows_read`:
+
+| run | unbounded (committed until 2026-09-28) | per-bucket, bounded | **shipped** |
+|---|---:|---:|---:|
+| one `by_day` date | 16.3M | 540k | **178k** |
+| 7-day grid | — | 3.65M | **1.21M** |
+| scheduled run (3 dates + grid) | ~20–30M (remote, measured) | 5.27M | **1.75M** |
+
+**Output is unchanged.** On the same data the committed SQL and the shipped SQL were diffed
+row for row — 48 of 48 day rows and 982 of 982 grid rows identical, with ADDED trips,
+late-entering trips, NULL predictions and id gaps in the data. One intentional difference: two
+snapshots of one (trip, stop) with the same stored `horizon_sec` now resolve to the earlier
+`predicted_arrival`; `ROW_NUMBER()` left that tie arbitrary.
+
+**Measured on the shipped code** with a fixed clock: the first scheduled run
+(2026-09-29, one full day in the grid) read **702k**; once the 7-day window is full,
+**1.75M**. The Sept 8 rows were untouched and no pre-floor date was recomputed.
+
+**Gated on the account's read total.** The scheduled run fetches Cloudflare's own count and
+runs only if at most 1.5M rows have been read so far that UTC day — and never when that count
+is unavailable. A skipped rollup is recomputed tomorrow; a rollup that exhausts the budget
+costs the rest of the day's collection, which is not.
+
+**Each date is one transaction.** `DELETE` and `INSERT` go in a single `db.batch()`. The old
+code ran the `DELETE` as its own statement; when the `INSERT`s hit the read limit the delete
+had already committed, which is why `rollup_error_by_slice` was found **empty**.
+
+**The grid window is a real limitation.** A typical-week grid needs months of data; a 7-day
+window cannot reach the display gate in `web/components/SliceGrid.tsx`, so the grid is
+correct but stays hidden. Recomputing medians over months each day does not fit the read
+budget, and medians do not compose across days. Rendering it needs a composable store
+(e.g. per-prediction graded errors, written once) — a change to the "error is never stored"
+decision in CLAUDE.md, so not made here. `/api/error-by-slice` reports `window_days`.
 
 **In-progress days are marked, not silently included.** `rollup_error_by_day.is_partial = 1`
 for the open service date. Marking rather than exclusion keeps today queryable, but the flag
@@ -444,6 +569,13 @@ seconds later. Retry before debugging credentials.
 ## Limitations
 
 <!-- web:limitations:start -->
+- **Collection was degraded from Sept 1 to Sept 28.** D1's free-tier read limit ran out
+  every night, so data was stored only from 20:00 ET until the budget was gone — about
+  02:15–04:30 ET early in the month, about 01:30 ET by the end. Rush hours in that window
+  are missing and cannot be recovered. The cause was one matcher query scanning an
+  unindexed table on every run; it was found with `wrangler d1 insights` and fixed with a
+  partial index. Summaries start from 2026-09-28. Per-day figures for Sept 1–8 were computed
+  before the fix and cover only part of each day.
 - **The Green Line E diversion splits the record.** The E branch was suspended
   Aug 1-2 and again Aug 8-16, so `place-nuniv` reports zero predictions on those
   dates. That is real absence of service, not a collection gap. The branch
@@ -534,9 +666,11 @@ evidence that MBTA predicts termini better.
 
 ## Guardrails
 
-On the free tier the daily write cap is the thing most likely to take this down, and it
-fails silently: writes start being rejected, and the minutes lost while nobody notices are
-unrecoverable. Three mechanisms cover it.
+On the free tier the daily quotas are what take this down, and they fail silently:
+queries start being rejected, and the minutes lost while nobody notices are unrecoverable.
+This section originally said the *write* cap was the likely failure. It was the **read**
+cap, and it cost four weeks of rush hours — see the incident above. Four mechanisms now
+cover it.
 
 ### 1. The write counter on `/status`
 
@@ -580,7 +714,7 @@ not:
 
 | kind | meaning |
 |------|---------|
-| `d1_limit` | D1 refused the write — quota, rate, or storage. **Data is being lost.** |
+| `d1_limit` | D1 refused a query — read quota, write quota, rate, or storage. **Data is being lost.** |
 | `d1_other` | D1 ran and refused — syntax, constraint, missing column. |
 | `mbta_api` | MBTA returned non-2xx. The next tick re-reads the same predictions. |
 | `timeout` | Our own 10s fetch timeout tripped. |
@@ -609,6 +743,26 @@ it without touching D1 at all.
 
 Verified end-to-end: with the collector stopped, `/status` flipped to 503 with
 `collecting: false` at 158s.
+
+### 4. The read counter on `/status`
+
+`read_budget` has the same projection and the same `ok` / `warn` (70%) / `critical` (90%)
+levels as `write_budget`, against D1's 5,000,000 rows/day. Two differences, both on purpose:
+
+- **Source is Cloudflare's GraphQL analytics, account-wide**, not our own counts. The limit
+  is enforced on the account total, and self-reporting only sees code that reports itself.
+  It also works while D1 is refusing queries. Lags real time by a few minutes.
+- **If it cannot be fetched, `level` is `unknown`, never `ok`.** Needs `CF_ACCOUNT_ID`
+  (in `wrangler.toml`) and a `CF_API_TOKEN` secret with only *Account Analytics: Read*.
+
+**Post-fix measurement:** *pending the first full day after the 2026-09-28 deploy.*
+
+`write_budget.account_reported_today` puts Cloudflare's write total beside our
+self-reported one; a gap between them is writes the collector does not account for
+(matcher, `arrival_counts`, manual queries).
+
+When D1 itself fails, `/status` now returns 503 with `d1_error` and the read budget instead of
+an unexplained 500. `collecting` is also false when reads are exhausted.
 
 ### What is deliberately not here
 
