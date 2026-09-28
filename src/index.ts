@@ -1,11 +1,20 @@
 import { runTick, type Env } from './collector';
 import { runBackfill, runMatch } from './matcher';
-import { runRollup } from './rollup';
+import { ROLLUP_FLOOR, runRollup, shouldRecompute } from './rollup';
+import { fetchAccountUsage, type AccountUsage } from './usage';
 import { errorByDay, errorByHorizon, errorBySlice, summary } from './api';
 import { buildStatus, DAILY_WRITE_LIMIT } from './status';
 
 /** Must match the second entry in wrangler.toml [triggers] crons. */
 const MATCHER_CRON = '*/15 * * * *';
+
+/**
+ * The scheduled rollup runs only if the account has read at most this many rows
+ * so far today. 5M limit - ~1.75M measured rollup cost - the rest of the day's
+ * matcher and collector reads leaves this with margin; at 04:00 local (08:00 UTC)
+ * a healthy day has read well under it.
+ */
+const ROLLUP_MAX_READS_BEFORE = 1_500_000;
 
 export default {
   async scheduled(event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
@@ -30,16 +39,36 @@ export default {
           by_source: match.by_source,
         });
       }
-      // THE SCHEDULED ROLLUP IS DISABLED until it is rewritten to a bounded
-      // read. Measured with `wrangler d1 insights`, each of its 8 INSERT ...
-      // SELECT statements reads 1.4M-3.8M rows — every one joins the whole of
-      // prediction_snapshots, which has no index — so one recompute is ~20-30M
-      // reads against a 5M/day budget. Unaffordable at any hour.
+      // Rollups ride the matcher cron, gated on LOCAL hour so DST cannot drift
+      // the schedule onto the 03:00 service-date rollover, and run after the
+      // matcher so the day they summarise is as fully graded as it will get.
       //
-      // Until 2026-09-28 it was harmless only by accident: at 04:00 local the
-      // budget was already gone, so it failed immediately. With the matcher fixed
-      // the budget survives to 04:00, and this rollup would then exhaust it,
-      // losing collection from 04:00 to 20:00 local — both rush hours.
+      // BOUNDED, AND GATED ON THE READ BUDGET. The unbounded rollup read ~20-30M
+      // rows (measured) against a 5M/day limit. This one recomputes three service
+      // dates and a 7-day grid through rowid ranges: ~1.75M reads measured at
+      // production scale. It still runs only if Cloudflare's own account total
+      // says there is room, and never on an unknown — a rollup that exhausts the
+      // budget costs the rest of the day's collection, which is unrecoverable,
+      // while a skipped rollup is recomputed tomorrow.
+      const nowSec = Math.floor(Date.now() / 1000);
+      if (shouldRecompute(nowSec, Math.floor(nowSec / 60) % 60)) {
+        let usage: AccountUsage | null = null;
+        try {
+          usage = await fetchAccountUsage(env, nowSec);
+        } catch (err) {
+          console.error('rollup skipped: read usage unavailable', String(err));
+        }
+        if (usage && usage.rows_read_today <= ROLLUP_MAX_READS_BEFORE) {
+          const roll = await runRollup(env, Date.now());
+          if (roll.error) console.error('rollup failed', roll);
+          else console.log('rollup', roll);
+        } else if (usage) {
+          console.error('rollup skipped: read budget', {
+            rows_read_today: usage.rows_read_today,
+            threshold: ROLLUP_MAX_READS_BEFORE,
+          });
+        }
+      }
       return;
     }
 
@@ -67,15 +96,32 @@ export default {
       return json(status, status.collecting ? 200 : 503);
     }
 
-    // Manual rollup recompute. Wants ~20-30M rows read against a 5M/day limit,
-    // so it exhausts the day's budget partway through, stops collection until
-    // the next 00:00 UTC reset, and leaves the table it was rebuilding deleted
-    // but not refilled. Do not call this until the rollup is rewritten.
+    // Manual rollup recompute, bounded exactly like the scheduled one but NOT
+    // gated on the read budget — check /status read_budget before calling it.
+    //   ?date=YYYY-MM-DD  one service date of rollup_error_by_day, grid untouched.
+    //                     Refused before ROLLUP_FLOOR: those dates are not
+    //                     summarised, and their existing rows are left alone.
+    //   ?slice=only       the typical-week grid only
+    //   (neither)         what the schedule runs: recent dates + the grid
+    // Every response carries rows_read, D1's own measurement of what it cost.
     if (url.pathname === '/rollup' && request.method === 'POST') {
       if (!env.COLLECT_TOKEN || url.searchParams.get('token') !== env.COLLECT_TOKEN) {
         return json({ error: 'unauthorized' }, 401);
       }
-      return json(await runRollup(env, Date.now()));
+      const date = url.searchParams.get('date');
+      if (date !== null && !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+        return json({ error: 'date must be YYYY-MM-DD' }, 400);
+      }
+      if (date !== null && date < ROLLUP_FLOOR) {
+        return json({ error: `dates before ${ROLLUP_FLOOR} are not summarised` }, 400);
+      }
+      const opts =
+        date !== null
+          ? { byDayDates: [date], slice: false }
+          : url.searchParams.get('slice') === 'only'
+            ? { byDayDates: [], slice: true }
+            : {};
+      return json(await runRollup(env, Date.now(), opts));
     }
 
     // Manual full backfill over all collected data, separate from the cron. Resets

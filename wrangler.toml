@@ -20,3 +20,10 @@ enabled = true
 # Secrets, set with `wrangler secret put <NAME>` — never in this file:
 #   MBTA_API_KEY  optional; raises the rate limit from 20 to 1000 req/min
 #   COLLECT_TOKEN optional; enables POST /collect?token=… to trigger a tick
+#   CF_API_TOKEN  a Cloudflare API token with ONLY Account > Account Analytics >
+#                 Read. Gates the scheduled rollup on the account's read total;
+#                 without it the scheduled rollup never runs.
+
+[vars]
+# Not a secret: the account id appears in every Cloudflare dashboard URL.
+CF_ACCOUNT_ID = "d4766f1fd2394e896ab3b476137b7e84"

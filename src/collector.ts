@@ -26,6 +26,9 @@ export interface Env {
   MBTA_API_KEY?: string;
   /** If set, enables POST /collect?token=… to trigger a tick by hand. */
   COLLECT_TOKEN?: string;
+  /** Cloudflare account id and an Account Analytics: Read token, for read usage. */
+  CF_ACCOUNT_ID?: string;
+  CF_API_TOKEN?: string;
 }
 
 export interface RunRecord {
