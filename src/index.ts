@@ -1,6 +1,6 @@
 import { runTick, type Env } from './collector';
 import { runBackfill, runMatch } from './matcher';
-import { runRollup, shouldRecompute } from './rollup';
+import { runRollup } from './rollup';
 import { errorByDay, errorByHorizon, errorBySlice, summary } from './api';
 import { buildStatus, DAILY_WRITE_LIMIT } from './status';
 
@@ -30,15 +30,16 @@ export default {
           by_source: match.by_source,
         });
       }
-      // Rollups ride the matcher cron, gated on LOCAL hour so DST cannot drift
-      // the schedule onto the 03:00 service-date rollover. Runs after the matcher
-      // so the day it summarises is as fully graded as it will get.
-      const nowSec = Math.floor(Date.now() / 1000);
-      if (shouldRecompute(nowSec, Math.floor(nowSec / 60) % 60)) {
-        const roll = await runRollup(env, Date.now());
-        if (roll.error) console.error('rollup failed', roll);
-        else console.log('rollup', roll);
-      }
+      // THE SCHEDULED ROLLUP IS DISABLED until it is rewritten to a bounded
+      // read. Measured with `wrangler d1 insights`, each of its 8 INSERT ...
+      // SELECT statements reads 1.4M-3.8M rows — every one joins the whole of
+      // prediction_snapshots, which has no index — so one recompute is ~20-30M
+      // reads against a 5M/day budget. Unaffordable at any hour.
+      //
+      // Until 2026-09-28 it was harmless only by accident: at 04:00 local the
+      // budget was already gone, so it failed immediately. With the matcher fixed
+      // the budget survives to 04:00, and this rollup would then exhaust it,
+      // losing collection from 04:00 to 20:00 local — both rush hours.
       return;
     }
 
@@ -66,7 +67,10 @@ export default {
       return json(status, status.collecting ? 200 : 503);
     }
 
-    // Manual rollup recompute, for verifying without waiting for 04:00 local.
+    // Manual rollup recompute. Wants ~20-30M rows read against a 5M/day limit,
+    // so it exhausts the day's budget partway through, stops collection until
+    // the next 00:00 UTC reset, and leaves the table it was rebuilding deleted
+    // but not refilled. Do not call this until the rollup is rewritten.
     if (url.pathname === '/rollup' && request.method === 'POST') {
       if (!env.COLLECT_TOKEN || url.searchParams.get('token') !== env.COLLECT_TOKEN) {
         return json({ error: 'unauthorized' }, 401);
@@ -75,8 +79,10 @@ export default {
     }
 
     // Manual full backfill over all collected data, separate from the cron. Resets
-    // the watermark to 0 and repeats until the scan stops advancing. Safe to run
-    // at any time: every write is a confidence-guarded upsert.
+    // the watermark to 0 and repeats until the scan stops advancing. Safe for the
+    // DATA at any time: every write is a confidence-guarded upsert. NOT safe for
+    // the read budget: every pass over a date before the partial index floor
+    // (migration 0009) scans all of vehicle_observations, ~237k rows a pass.
     if (url.pathname === '/backfill' && request.method === 'POST') {
       if (!env.COLLECT_TOKEN || url.searchParams.get('token') !== env.COLLECT_TOKEN) {
         return json({ error: 'unauthorized' }, 401);

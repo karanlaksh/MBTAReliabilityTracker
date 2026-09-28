@@ -582,6 +582,50 @@ function finish(stats: MatchStats, startedAtMs: number): MatchStats {
 }
 
 /**
+ * Lower bound of the partial index on vehicle_observations(service_date). Must
+ * equal the literal in migrations/0009_read_budget.sql, character for character:
+ * SQLite matches a partial index's WHERE term textually, not by implication.
+ */
+export const INDEX_FLOOR = '2026-09-27';
+
+const OBSERVATION_COLS = `service_date, trip_id, vehicle_id, stop_id, current_status,
+              current_stop_sequence, vehicle_updated_at`;
+
+/**
+ * One query for dates the partial index covers, one for any it does not.
+ *
+ * The indexed query carries `service_date >= '<floor>'` redundantly — every bound
+ * date already satisfies it — because that literal term is what licenses SQLite
+ * to use the partial index. It returns exactly the rows the unindexed query
+ * would, so splitting cannot change what the matcher sees.
+ */
+function observationQueries(dates: string[]): { sql: string; binds: string[] }[] {
+  const indexed = dates.filter((d) => d >= INDEX_FLOOR);
+  const unindexed = dates.filter((d) => d < INDEX_FLOOR);
+  const inList = (n: number) => Array.from({ length: n }, () => '?').join(',');
+
+  const out: { sql: string; binds: string[] }[] = [];
+  if (indexed.length > 0) {
+    out.push({
+      sql: `SELECT ${OBSERVATION_COLS}
+         FROM vehicle_observations
+        WHERE service_date >= '${INDEX_FLOOR}' AND service_date IN (${inList(indexed.length)})`,
+      binds: indexed,
+    });
+  }
+  if (unindexed.length > 0) {
+    // Full scan. Only a /backfill over pre-floor data should ever reach this.
+    console.warn('matcher: unindexed vehicle_observations scan', { dates: unindexed });
+    out.push({
+      sql: `SELECT ${OBSERVATION_COLS}
+         FROM vehicle_observations WHERE service_date IN (${inList(unindexed.length)})`,
+      binds: unindexed,
+    });
+  }
+  return out;
+}
+
+/**
  * Load vehicle observations for the settled candidates' trips, plus any
  * observation by the same vehicles at the same stops (which is how a terminus
  * turnaround is found, since it is filed under a different trip_id).
@@ -597,23 +641,27 @@ async function loadObservations(
   const out = new Map<string, ObservationRow[]>();
   if (dates.length === 0) return out;
 
-  // Bound the read by service_date, then filter in memory. vehicle_observations
-  // has no secondary index either, so a scan restricted to the dates in play is
-  // cheaper than one round trip per candidate.
-  const datePlaceholders = dates.map(() => '?').join(',');
-  const { results } = await db
-    .prepare(
-      `SELECT service_date, trip_id, vehicle_id, stop_id, current_status,
-              current_stop_sequence, vehicle_updated_at
-         FROM vehicle_observations WHERE service_date IN (${datePlaceholders})`,
-    )
-    .bind(...dates)
-    .all<ObservationRow>();
+  // Read the dates in play, then filter in memory by trip and vehicle.
+  //
+  // This comment used to claim the service_date filter "bounds the read". It did
+  // not: with no index, the WHERE filters the result, not the scan, so every run
+  // read the whole table (~237k rows, 96 runs/day) and exhausted D1's 5M/day
+  // read limit by ~01:30 local, every day, for four weeks. See migration 0009.
+  //
+  // The index is PARTIAL (service_date >= INDEX_FLOOR), because building a full
+  // one would have cost more writes than a day's budget. SQLite only uses a
+  // partial index when the query repeats its WHERE term literally, hence the
+  // inlined constant. Dates before the floor — a manual /backfill — still scan.
+  const results: ObservationRow[] = [];
+  for (const { sql, binds } of observationQueries(dates)) {
+    const res = await db.prepare(sql).bind(...binds).all<ObservationRow>();
+    results.push(...(res.results ?? []));
+  }
 
   const tripSet = new Set(trips);
   const vehicleSet = new Set(vehicles);
 
-  for (const o of results ?? []) {
+  for (const o of results) {
     const relevant =
       (o.trip_id !== null && tripSet.has(o.trip_id)) || vehicleSet.has(o.vehicle_id);
     if (!relevant) continue;
@@ -709,4 +757,11 @@ export async function runBackfill(env: Env, maxPasses = 40): Promise<MatchStats[
   return passes;
 }
 
-export const __test = { groupCandidates, resolveArrival, isSkipped, isImplausible, serviceDate };
+export const __test = {
+  groupCandidates,
+  resolveArrival,
+  isSkipped,
+  isImplausible,
+  serviceDate,
+  observationQueries,
+};

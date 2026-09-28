@@ -1,0 +1,37 @@
+-- MBTA Reliability Tracker — migration 0009
+--
+-- The read budget. From about 2026-09-02 to 2026-09-28, D1's 5,000,000
+-- rows-read/day free-tier limit was exhausted by ~05:30-06:30 UTC every day,
+-- after which every query was refused until 00:00 UTC. The collector only
+-- stored data between ~20:00 and ~01:30 America/New_York.
+--
+-- Cause, from `wrangler d1 insights` over 7 days: 29.2M of 32.2M rows read
+-- (91%) were one matcher query, `vehicle_observations WHERE service_date IN (?)`.
+-- With no index, that WHERE filters the result, not the scan: every run read
+-- the whole table (~237k rows), 96 times a day.
+--
+-- ---------------------------------------------------------------------------
+-- Index vehicle_observations(service_date) — PARTIAL, from 2026-09-27 on.
+--
+-- A full index is not affordable to BUILD. CREATE INDEX writes one index row per
+-- existing row, and D1 counts those against the same 100,000/day write limit:
+-- ~237k existing rows would blow the day's write budget in one statement, and
+-- the collector would lose the very day this migration is meant to save.
+--
+-- The partial index only covers service dates the matcher will still touch in
+-- normal operation, so the build writes only those rows (a few thousand).
+-- Ongoing cost is one extra written row per vehicle observation (~5,000/day at
+-- full collection), the same as a full index would cost.
+--
+-- The floor is 2026-09-27, not 09-28: the matcher's watermark is still inside
+-- service date 09-27 when this deploys, and a pre-floor date falls back to the
+-- full scan.
+--
+-- SQLite only uses a partial index when the query's WHERE contains the index's
+-- WHERE term literally, so the matcher repeats `service_date >= '2026-09-27'` as
+-- a literal. INDEX_FLOOR in src/matcher.ts must equal the date below. Dates
+-- before the floor (a manual /backfill) still scan, exactly as before.
+-- ---------------------------------------------------------------------------
+CREATE INDEX vehicle_observations_service_date
+  ON vehicle_observations (service_date)
+  WHERE service_date >= '2026-09-27';
