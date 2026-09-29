@@ -6,6 +6,23 @@
 export const WORKER_BASE =
   process.env.NEXT_PUBLIC_WORKER_BASE ?? 'https://mbta-collector.mbta-collector.workers.dev';
 
+/**
+ * The primary analysis window: the headline finding and the mode comparison are
+ * graded over these dates only, not pooled across all time. A pooled figure
+ * would average complete August days together with the partial days of the
+ * September read-limit outage, which is not a like-for-like comparison.
+ */
+export const PRIMARY_WINDOW = { from: '2026-08-01', to: '2026-08-19', label: 'Aug 1–19, 2026' } as const;
+
+/**
+ * Service dates degraded by the September read-limit outage: collection ran only
+ * from 20:00 ET until D1's daily read budget ran out. Shown on the day-by-day
+ * chart as a labelled gap, never plotted as points — a partial day reads as a
+ * change in accuracy when it is really missing data. See the README incident.
+ * Sept 28 is included: collection was refused until the fix deployed at 20:24 ET.
+ */
+export const DEGRADED_WINDOW = { from: '2026-09-01', to: '2026-09-28', label: 'Sept 1–28' } as const;
+
 /** Evaluation points, never bands. See BUCKETS in src/rollup.ts for why. */
 export const BUCKETS = ['~1.5 min', '~4.5 min', '~9 min', '~16 min'] as const;
 export type Bucket = (typeof BUCKETS)[number];

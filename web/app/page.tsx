@@ -6,6 +6,8 @@ import ModeComparison from '@/components/ModeComparison';
 import SliceGrid from '@/components/SliceGrid';
 import TimeSeries from '@/components/TimeSeries';
 import {
+  DEGRADED_WINDOW,
+  PRIMARY_WINDOW,
   getJson,
   type DayResponse,
   type HorizonResponse,
@@ -28,7 +30,12 @@ export default async function Page() {
   // Fetched in parallel; each returns a value on failure rather than throwing, so
   // one dead endpoint degrades a section instead of the page.
   const [horizon, days, summary, slices] = await Promise.all([
-    getJson<HorizonResponse>('/api/error-by-horizon'),
+    // The finding and the mode comparison are graded over the primary window only,
+    // not pooled across the September outage. The day-by-day series is not
+    // windowed: it shows everything, with the outage as a labelled gap.
+    getJson<HorizonResponse>(
+      `/api/error-by-horizon?from=${PRIMARY_WINDOW.from}&to=${PRIMARY_WINDOW.to}`,
+    ),
     getJson<DayResponse>('/api/error-by-day'),
     getJson<SummaryResponse>('/api/summary'),
     getJson<SliceResponse>('/api/error-by-slice?min_n=20'),
@@ -56,19 +63,40 @@ export default async function Page() {
         </p>
       </header>
 
-      <DegradedBanner messages={problems} />
+      {/* One quiet paragraph, not a failure box: nobody should scroll past a list
+          of HTTP errors to reach the result. The failure detail sits with the
+          section the failing endpoints actually feed. */}
+      <p className="mb-8 text-sm text-[var(--text-secondary)]">
+        Primary analysis covers {PRIMARY_WINDOW.label}. Collection was degraded{' '}
+        {DEGRADED_WINDOW.label} &mdash; see{' '}
+        <a href="#limitations" className="underline underline-offset-2">
+          limitations
+        </a>
+        .
+        {problems.length > 0 ? (
+          <>
+            {' '}
+            Some figures may currently be incomplete &mdash; see{' '}
+            <a href="#collection-status" className="underline underline-offset-2">
+              collection status
+            </a>
+            .
+          </>
+        ) : null}
+      </p>
 
       {/* 1. THE FINDING, generated from data, above everything else. */}
       <section className="mb-14 border-y border-[var(--rule)] py-8">
-        <Finding series={series} />
+        <Finding series={series} windowLabel={PRIMARY_WINDOW.label} />
       </section>
 
       {/* 2. MODE COMPARISON. */}
       <section className="mb-14">
         <h2 className="text-lg font-semibold">Accuracy by how far ahead the prediction was made</h2>
         <p className="mb-5 mt-1 max-w-2xl text-sm text-[var(--text-secondary)]">
-          Each point is graded at a fixed horizon &mdash; the prediction that was on the display when
-          the vehicle was that far away. Positive means it arrived later than promised.
+          {PRIMARY_WINDOW.label}. Each point is graded at a fixed horizon &mdash; the prediction that
+          was on the display when the vehicle was that far away. Positive means it arrived later than
+          promised.
         </p>
         <ModeComparison series={series} />
       </section>
@@ -83,7 +111,10 @@ export default async function Page() {
         {days.data ? (
           <TimeSeries rows={days.data.rows} />
         ) : (
-          <p className="text-sm text-[var(--text-secondary)]">Insufficient data.</p>
+          // A failed fetch is not a shortage of data, and must not read as one.
+          <p className="text-sm text-[var(--text-secondary)]">
+            Day-by-day figures could not be loaded &mdash; see collection status.
+          </p>
         )}
       </section>
 
@@ -93,8 +124,9 @@ export default async function Page() {
         <SliceGrid data={slices.data} />
       </section>
 
-      {/* 4. COLLECTION STATUS. */}
-      <section className="mb-14">
+      {/* 4. COLLECTION STATUS, with the degraded banner directly above it. */}
+      <DegradedBanner messages={problems} />
+      <section id="collection-status" className="mb-14 scroll-mt-8">
         <h2 className="text-lg font-semibold">Collection status</h2>
         <p className="mb-5 mt-1 max-w-2xl text-sm text-[var(--text-secondary)]">
           What has been collected, and how completely.
@@ -109,7 +141,7 @@ export default async function Page() {
       </section>
 
       {/* Limitations: on the page, not in a footer. */}
-      <section className="mb-14 rounded-lg bg-[var(--surface-2)] p-6">
+      <section id="limitations" className="mb-14 scroll-mt-8 rounded-lg bg-[var(--surface-2)] p-6">
         <h2 className="text-lg font-semibold">What this does not show</h2>
         <p className="mb-5 mt-1 max-w-2xl text-sm text-[var(--text-secondary)]">
           Read these before quoting any number above. They are sourced from the project&rsquo;s own

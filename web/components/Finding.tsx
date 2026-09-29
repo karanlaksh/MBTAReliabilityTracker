@@ -8,7 +8,14 @@ import { fmtInt, fmtSigned, type HorizonSeries } from '@/lib/api';
  * is the claim worth putting at the top. The curve rising with horizon mostly
  * demonstrates that the matcher works — real but supporting.
  */
-export default function Finding({ series }: { series: HorizonSeries[] }) {
+export default function Finding({
+  series,
+  windowLabel,
+}: {
+  series: HorizonSeries[];
+  /** The dates the figures are graded over, stated beside the sample sizes. */
+  windowLabel: string;
+}) {
   const pick = (routeId: string) => series.find((s) => s.route_id === routeId);
   const at = (s: HorizonSeries | undefined, bucket: string) =>
     s?.points.find((p) => p.bucket === bucket);
@@ -42,7 +49,7 @@ export default function Finding({ series }: { series: HorizonSeries[] }) {
         Error grows with how far ahead the prediction was made — the Orange Line goes from{' '}
         {fmtSigned(orangeNear.median_sec)} at ~1.5 min to {fmtSigned(orangeFar?.median_sec)} at ~16
         min — which is the expected shape and mostly a sign the measurement is sound.
-        Sample sizes: {fmtInt(orangeNear.n)} graded Orange Line predictions and{' '}
+        Sample sizes over {windowLabel}: {fmtInt(orangeNear.n)} graded Orange Line predictions and{' '}
         {fmtInt(busNear.n)} for Bus 39 at that point.
       </p>
       <p className="mt-3 text-sm text-[var(--text-muted)]">

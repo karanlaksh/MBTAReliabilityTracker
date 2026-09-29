@@ -569,13 +569,30 @@ seconds later. Retry before debugging credentials.
 ## Limitations
 
 <!-- web:limitations:start -->
-- **Collection was degraded from Sept 1 to Sept 28.** D1's free-tier read limit ran out
-  every night, so data was stored only from 20:00 ET until the budget was gone — about
-  02:15–04:30 ET early in the month, about 01:30 ET by the end. Rush hours in that window
-  are missing and cannot be recovered. The cause was one matcher query scanning an
-  unindexed table on every run; it was found with `wrangler d1 insights` and fixed with a
-  partial index. Summaries start from 2026-09-28. Per-day figures for Sept 1–8 were computed
-  before the fix and cover only part of each day.
+- **Collection was degraded from Sept 1 to Sept 28.** The database's free tier allows 5
+  million rows read per day. One matcher query scanned an unindexed table in full on every
+  run, 96 times a day, and used up that budget each night. After that, every query was
+  refused until the daily reset at 20:00 ET. So for four weeks data was stored only from
+  20:00 ET until the budget ran out: about 02:15–04:30 ET in the first week, about 01:30 ET
+  by the end. Every rush hour in that window is missing and cannot be recovered, because
+  MBTA predictions are overwritten as they change. The cause was found with
+  `wrangler d1 insights`, which showed that one query accounted for 91% of all rows read. It
+  was fixed with a partial index. The headline figures use Aug 1–19; the September dates
+  are shown as a gap and not plotted.
+- **The outage ran for four weeks because the monitoring was watching the wrong thing.**
+  The collector logged all ~1,440 of its runs every day, and ~1,100 of them had been
+  refused. The run log looked complete, because recording a run is a write and only reads
+  were being refused. Each refusal was logged, but under a label that said the database had
+  refused a write. The only budget being tracked was writes, which were fine, and nothing
+  measured reads at all. So there was a visible symptom, with nothing that named the cause
+  or warned it was coming. The fix for that is a read counter on the status endpoint, taken
+  from Cloudflare's own account-wide numbers rather than from the collector's report on
+  itself.
+- **Aug 18 and Aug 20–30 are suspect.** On those days 30–43% of arrivals were left
+  unmatched, against 1–5% on every other August day. Collection volume was normal, so
+  something went wrong in matching or in the vehicle data, and the cause is not yet
+  known. Aug 18 falls inside the headline window. Removing it moves the headline by under a
+  second (Bus 39 at ~1.5 min: +29.4s with it, +29.7s without).
 - **The Green Line E diversion splits the record.** The E branch was suspended
   Aug 1-2 and again Aug 8-16, so `place-nuniv` reports zero predictions on those
   dates. That is real absence of service, not a collection gap. The branch

@@ -2,9 +2,22 @@
 
 import { useState } from 'react';
 import {
-  CartesianGrid, Line, LineChart, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis, Legend,
+  CartesianGrid, Line, LineChart, ReferenceArea, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis, Legend,
 } from 'recharts';
-import { BUCKETS, ROUTE_COLOR, fmtInt, fmtSigned, type Bucket, type DayRow } from '@/lib/api';
+import {
+  BUCKETS, DEGRADED_WINDOW, ROUTE_COLOR, fmtInt, fmtSigned, type Bucket, type DayRow,
+} from '@/lib/api';
+
+/** Every ISO date from `from` to `to` inclusive. */
+function dateRange(from: string, to: string): string[] {
+  const out: string[] = [];
+  for (let t = Date.parse(`${from}T12:00:00Z`); t <= Date.parse(`${to}T12:00:00Z`); t += 86_400_000) {
+    out.push(new Date(t).toISOString().slice(0, 10));
+  }
+  return out;
+}
+
+const isDegraded = (d: string) => d >= DEGRADED_WINDOW.from && d <= DEGRADED_WINDOW.to;
 
 /**
  * Partial days are DROPPED from the plotted line, not drawn faintly.
@@ -14,6 +27,11 @@ import { BUCKETS, ROUTE_COLOR, fmtInt, fmtSigned, type Bucket, type DayRow } fro
  * appears precisely where the eye expects the newest and most interesting data.
  * They are listed below the chart instead, so they are disclosed rather than
  * hidden, but nothing can mistake one for a complete point.
+ *
+ * The same reasoning covers DEGRADED_WINDOW, the September read-limit outage:
+ * those dates are partial by construction. The axis is continuous, so the gap
+ * occupies its real width and is shaded and labelled — visible, never collapsed
+ * into a seamless line from August to late September.
  */
 export default function TimeSeries({ rows }: { rows: DayRow[] }) {
   const [bucket, setBucket] = useState<Bucket>('~9 min');
@@ -24,11 +42,20 @@ export default function TimeSeries({ rows }: { rows: DayRow[] }) {
 
   const routes = [...new Set(complete.map((r) => r.route_id))];
   const dates = [...new Set(complete.map((r) => r.service_date))].sort();
+  const degradedWithData = dates.filter(isDegraded);
 
-  const data = dates.map((d) => {
+  // Continuous axis from the first date to the later of the last date and the end
+  // of the degraded window, so the gap is drawn at its true width.
+  const axis = dates.length
+    ? dateRange(dates[0], dates[dates.length - 1] > DEGRADED_WINDOW.to ? dates[dates.length - 1] : DEGRADED_WINDOW.to)
+    : [];
+
+  const data = axis.map((d) => {
     const row: Record<string, string | number | null> = { service_date: d.slice(5) };
     for (const rt of routes) {
-      const hit = complete.find((r) => r.service_date === d && r.route_id === rt);
+      const hit = isDegraded(d)
+        ? undefined
+        : complete.find((r) => r.service_date === d && r.route_id === rt);
       // Below threshold reads as absent, not as zero.
       row[rt] = hit && hit.n >= 20 ? hit.median_sec : null;
       row[`${rt}__n`] = hit?.n ?? 0;
@@ -65,7 +92,28 @@ export default function TimeSeries({ rows }: { rows: DayRow[] }) {
         <ResponsiveContainer width="100%" height="100%">
           <LineChart data={data} margin={{ top: 8, right: 16, bottom: 4, left: 4 }}>
             <CartesianGrid stroke="var(--grid)" vertical={false} />
-            <XAxis dataKey="service_date" tick={{ fontSize: 11, fill: 'var(--text-secondary)' }} stroke="var(--rule)" tickLine={false} />
+            <XAxis
+              dataKey="service_date"
+              tick={{ fontSize: 11, fill: 'var(--text-secondary)' }}
+              stroke="var(--rule)"
+              tickLine={false}
+              interval="preserveStartEnd"
+              minTickGap={24}
+            />
+            <ReferenceArea
+              x1={DEGRADED_WINDOW.from.slice(5)}
+              x2={DEGRADED_WINDOW.to.slice(5)}
+              fill="var(--surface-2)"
+              fillOpacity={1}
+              stroke="var(--rule)"
+              strokeDasharray="3 3"
+              label={{
+                value: `collection degraded, ${DEGRADED_WINDOW.label} — not plotted`,
+                position: 'insideTop',
+                fontSize: 11,
+                fill: 'var(--text-muted)',
+              }}
+            />
             <YAxis
               tick={{ fontSize: 12, fill: 'var(--text-secondary)' }}
               stroke="var(--rule)"
@@ -117,7 +165,18 @@ export default function TimeSeries({ rows }: { rows: DayRow[] }) {
 
       <p className="mt-2 text-xs text-[var(--text-muted)]">
         Median signed error per service date at the {bucket} evaluation point. Gaps are dates with
-        fewer than 20 graded arrivals for that route.
+        fewer than 20 graded arrivals for that route. The shaded band is the September read-limit
+        outage, when collection ran only from 20:00 ET until the database&rsquo;s daily read budget
+        ran out
+        {degradedWithData.length > 0 ? (
+          <>
+            {' '}
+            &mdash; the {degradedWithData.length} partial date{degradedWithData.length === 1 ? '' : 's'}{' '}
+            recorded in it are not plotted
+          </>
+        ) : null}
+        ; see limitations. Aug 18 and Aug 20&ndash;30 left an unusually high share of arrivals
+        unmatched (30&ndash;43%, against 1&ndash;5% on other days), for a reason not yet determined.
         {partial.length > 0 && (
           <>
             {' '}
