@@ -4,11 +4,12 @@ import { fmtInt, type SliceResponse } from '@/lib/api';
  * The typical-week grid — stop x weekday x hour x bucket — deliberately NOT
  * rendered yet.
  *
- * The query is written and correct. Display is gated on sample size, and the gate
- * currently fails: mean n per cell is around 7, and only a small fraction of cells
- * reach n>=20. Drawing a median from six observations would be inventing precision.
- * The gate is data-driven, so this section turns itself on as months accumulate
- * without anyone editing code.
+ * Display is gated on sample size: a median from a handful of observations would
+ * be inventing precision. The gate is data-driven, so the section turns itself on
+ * once the data supports it, with no code change — PROVIDED the grid accumulates
+ * across dates. While the API reports a rolling window_days, each cell holds about
+ * one day of data and the gate cannot open; the box says so rather than implying
+ * it is filling in.
  */
 export default function SliceGrid({ data }: { data: SliceResponse | null }) {
   if (!data) return null;
@@ -21,19 +22,44 @@ export default function SliceGrid({ data }: { data: SliceResponse | null }) {
   const MIN_MEAN_N = 20;
   const ready = data.coverage >= MIN_COVERAGE && data.mean_n_per_cell >= MIN_MEAN_N;
   if (!ready) {
+    const counts = (
+      <>
+        Of {fmtInt(data.cells_total)} cells, {fmtInt(data.cells_passing)} currently reach
+        n&nbsp;&ge;&nbsp;{data.min_n} &mdash; {(data.coverage * 100).toFixed(1)}% coverage, at a mean
+        of {fmtInt(data.mean_n_per_cell)} observations per cell.
+      </>
+    );
+    // Worded from what the data can actually do. "Filling in" is only true when
+    // the grid accumulates; a rolling window never fills in, and saying it would
+    // is the same kind of promise the old "not enough data yet" box broke.
     return (
       <div className="rounded-lg border border-dashed border-[var(--rule)] px-5 py-4 text-sm">
-        <h2 className="font-semibold text-[var(--text-primary)]">
-          Typical week grid &mdash; not enough data yet
-        </h2>
-        <p className="mt-1 text-[var(--text-secondary)]">
-          A stop &times; weekday &times; hour breakdown needs far more history than exists. Of{' '}
-          {fmtInt(data.cells_total)} cells, {fmtInt(data.cells_passing)} currently reach
-          n&nbsp;&ge;&nbsp;{data.min_n} &mdash; {(data.coverage * 100).toFixed(1)}% coverage, at a
-          mean of {fmtInt(data.mean_n_per_cell)} observations per cell. A median from that would be
-          inventing precision, so this stays hidden until coverage reaches{' '}
-          {(MIN_COVERAGE * 100).toFixed(0)}% and mean n reaches {MIN_MEAN_N}.
-        </p>
+        {data.window_days ? (
+          <>
+            <h2 className="font-semibold text-[var(--text-primary)]">
+              Typical week grid &mdash; rolling {data.window_days}-day view
+            </h2>
+            <p className="mt-1 text-[var(--text-secondary)]">
+              A stop &times; weekday &times; hour breakdown, shown once each cell holds at least{' '}
+              {MIN_MEAN_N} graded predictions on average and {(MIN_COVERAGE * 100).toFixed(0)}% of cells
+              reach n&nbsp;&ge;&nbsp;{data.min_n}. {counts} It currently covers only the last{' '}
+              {data.window_days} days, so each cell holds about one day of data and cannot reach
+              that threshold until the grid accumulates across dates.
+            </p>
+          </>
+        ) : (
+          <>
+            <h2 className="font-semibold text-[var(--text-primary)]">
+              Typical week grid &mdash; filling in
+            </h2>
+            <p className="mt-1 text-[var(--text-secondary)]">
+              A stop &times; weekday &times; hour breakdown, accumulating one service date at a
+              time. {counts} It appears once {(MIN_COVERAGE * 100).toFixed(0)}% of cells reach
+              n&nbsp;&ge;&nbsp;{data.min_n} and the mean reaches {MIN_MEAN_N}, so no cell is drawn
+              from a handful of observations.
+            </p>
+          </>
+        )}
       </div>
     );
   }

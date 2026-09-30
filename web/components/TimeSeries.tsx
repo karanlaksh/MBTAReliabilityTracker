@@ -2,7 +2,7 @@
 
 import { useState } from 'react';
 import {
-  CartesianGrid, Line, LineChart, ReferenceArea, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis, Legend,
+  CartesianGrid, Line, LineChart, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis, Legend,
 } from 'recharts';
 import {
   BUCKETS, DEGRADED_WINDOW, ROUTE_COLOR, fmtInt, fmtSigned, type Bucket, type DayRow,
@@ -29,10 +29,15 @@ const isDegraded = (d: string) => d >= DEGRADED_WINDOW.from && d <= DEGRADED_WIN
  * hidden, but nothing can mistake one for a complete point.
  *
  * The same reasoning covers DEGRADED_WINDOW, the September read-limit outage:
- * those dates are partial by construction. The axis is continuous, so the gap
- * occupies its real width and is shaded and labelled — visible, never collapsed
- * into a seamless line from August to late September.
+ * those dates are partial by construction. The whole window collapses to ONE
+ * axis slot — a dashed break with its own tick — rather than 28 empty days. It
+ * is never removed: without it Aug 30 would sit directly beside Sept 29 and the
+ * line would read as consecutive days. Every other date keeps its own slot, so
+ * any future missing day still shows as a gap rather than silently closing up.
  */
+
+/** Axis key for the collapsed degraded window. Not a date, so it can't collide. */
+const BREAK_KEY = 'break';
 export default function TimeSeries({ rows }: { rows: DayRow[] }) {
   const [bucket, setBucket] = useState<Bucket>('~9 min');
 
@@ -44,16 +49,37 @@ export default function TimeSeries({ rows }: { rows: DayRow[] }) {
   const dates = [...new Set(complete.map((r) => r.service_date))].sort();
   const degradedWithData = dates.filter(isDegraded);
 
-  // Continuous axis from the first date to the later of the last date and the end
-  // of the degraded window, so the gap is drawn at its true width.
-  const axis = dates.length
+  // Every date from the first to the later of the last date and the end of the
+  // degraded window — the domain comes from the DATA; the window only extends it
+  // while nothing newer exists — with the degraded dates replaced by one slot.
+  const span = dates.length
     ? dateRange(dates[0], dates[dates.length - 1] > DEGRADED_WINDOW.to ? dates[dates.length - 1] : DEGRADED_WINDOW.to)
     : [];
+  const axis: string[] = [];
+  for (const d of span) {
+    if (!isDegraded(d)) axis.push(d);
+    else if (axis[axis.length - 1] !== BREAK_KEY) axis.push(BREAK_KEY);
+  }
+  const breakLabel = DEGRADED_WINDOW.label;
+  // Every fourth date plus the break and the last date, so the break's tick is
+  // always drawn rather than thinned away by the axis. Date ticks within two
+  // slots of the break are dropped: adjacent labels overprint each other, and the
+  // break's label is the one that must stay legible. Hovering still names a date.
+  const breakAt = axis.indexOf(BREAK_KEY);
+  const ticks = axis
+    .map((d) => (d === BREAK_KEY ? d : d.slice(5)))
+    .filter((d, i, all) => {
+      if (d === BREAK_KEY) return true;
+      if (breakAt >= 0 && Math.abs(i - breakAt) < 2) return false;
+      return i % 4 === 0 || i === all.length - 1;
+    });
 
   const data = axis.map((d) => {
-    const row: Record<string, string | number | null> = { service_date: d.slice(5) };
+    const row: Record<string, string | number | null> = {
+      service_date: d === BREAK_KEY ? BREAK_KEY : d.slice(5),
+    };
     for (const rt of routes) {
-      const hit = isDegraded(d)
+      const hit = d === BREAK_KEY
         ? undefined
         : complete.find((r) => r.service_date === d && r.route_id === rt);
       // Below threshold reads as absent, not as zero.
@@ -97,23 +123,13 @@ export default function TimeSeries({ rows }: { rows: DayRow[] }) {
               tick={{ fontSize: 11, fill: 'var(--text-secondary)' }}
               stroke="var(--rule)"
               tickLine={false}
-              interval="preserveStartEnd"
-              minTickGap={24}
+              ticks={ticks}
+              interval={0}
+              tickFormatter={(v) => (v === BREAK_KEY ? breakLabel : v)}
             />
-            <ReferenceArea
-              x1={DEGRADED_WINDOW.from.slice(5)}
-              x2={DEGRADED_WINDOW.to.slice(5)}
-              fill="var(--surface-2)"
-              fillOpacity={1}
-              stroke="var(--rule)"
-              strokeDasharray="3 3"
-              label={{
-                value: `collection degraded, ${DEGRADED_WINDOW.label} — not plotted`,
-                position: 'insideTop',
-                fontSize: 11,
-                fill: 'var(--text-muted)',
-              }}
-            />
+            {axis.includes(BREAK_KEY) ? (
+              <ReferenceLine x={BREAK_KEY} stroke="var(--text-muted)" strokeDasharray="3 3" />
+            ) : null}
             <YAxis
               tick={{ fontSize: 12, fill: 'var(--text-secondary)' }}
               stroke="var(--rule)"
@@ -129,7 +145,7 @@ export default function TimeSeries({ rows }: { rows: DayRow[] }) {
             />
             <Tooltip
               content={({ active, payload, label }: any) => {
-                if (!active || !payload?.length) return null;
+                if (!active || !payload?.length || label === BREAK_KEY) return null;
                 return (
                   <div className="rounded-md border border-[var(--rule)] bg-white px-3 py-2 text-sm shadow-sm">
                     <div className="mb-1 font-medium">{label}</div>
@@ -165,9 +181,9 @@ export default function TimeSeries({ rows }: { rows: DayRow[] }) {
 
       <p className="mt-2 text-xs text-[var(--text-muted)]">
         Median signed error per service date at the {bucket} evaluation point. Gaps are dates with
-        fewer than 20 graded arrivals for that route. The shaded band is the September read-limit
-        outage, when collection ran only from 20:00 ET until the database&rsquo;s daily read budget
-        ran out
+        fewer than 20 graded arrivals for that route. The dashed break marks {breakLabel}, compressed
+        to a single step: the read-limit outage, when collection ran only from 20:00 ET until the
+        database&rsquo;s daily read budget ran out
         {degradedWithData.length > 0 ? (
           <>
             {' '}

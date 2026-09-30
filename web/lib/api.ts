@@ -137,6 +137,12 @@ export interface SliceResponse {
   mean_n_per_cell: number;
   cells_passing: number;
   coverage: number;
+  /**
+   * Present while the grid covers a ROLLING window of this many days rather
+   * than accumulating across dates. A rolling window gives each cell about one
+   * day of data, so it cannot reach the display gate however long it runs.
+   */
+  window_days?: number;
   note: string;
   cells: {
     stop_id: string; route_id: string; direction_id: number; weekday: number;
