@@ -133,21 +133,29 @@ export interface SummaryResponse {
 
 export interface SliceResponse {
   min_n: number;
+  /** The displayed value. Share of predictions within 60s: exact and outlier-resistant. */
+  metric?: 'share_within_60s';
   cells_total: number;
   mean_n_per_cell: number;
   cells_passing: number;
   coverage: number;
+  /** The display gate, from the API so the page and the estimate cannot disagree. */
+  gate?: { minN: number; minCoverage: number; minMeanN: number };
+  /** How much has accumulated: the grid folds in one final service date at a time. */
+  accumulation?: { dates_folded: number; first: string | null; last: string | null };
+  /** When the gate should open at the current rate; date null while not estimable. */
+  estimate?: { date: string | null; weeks: number | null; basis: string };
   /**
-   * Present while the grid covers a ROLLING window of this many days rather
-   * than accumulating across dates. A rolling window gives each cell about one
-   * day of data, so it cannot reach the display gate however long it runs.
+   * Present only from the old API, when the grid was a ROLLING window of this
+   * many days rather than accumulating. Kept so the page stays honest if it is
+   * ever served by a Worker that predates migration 0011.
    */
   window_days?: number;
   note: string;
   cells: {
     stop_id: string; route_id: string; direction_id: number; weekday: number;
     hour: number; horizon_bucket: string; n: number;
-    median_error_sec: number | null; p90_error_sec: number | null;
+    share_within_60s: number;
   }[];
 }
 

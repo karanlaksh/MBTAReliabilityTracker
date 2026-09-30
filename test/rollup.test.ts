@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { ROLLUP_FLOOR, __test, runRollup } from '../src/rollup';
+import { GRID_BACKFILL, ROLLUP_FLOOR, __test, runRollup } from '../src/rollup';
 
 const { BUCKETS, shouldRecompute, gradedSql, statsSql } = __test;
 const at = (iso: string) => Math.floor(Date.parse(iso) / 1000);
@@ -174,60 +174,77 @@ describe('bounded read', () => {
   });
 });
 
-describe('runRollup atomicity', () => {
-  // A stand-in for D1 that records how statements reach it. The property under
-  // test is structural: no DELETE may ever execute on its own, outside the batch
-  // that also holds the INSERTs, because a standalone DELETE commits even when
-  // the INSERTs after it fail — which is how rollup_error_by_slice was emptied.
-  function fakeDb(failBatch: boolean) {
-    const calls: { kind: 'run' | 'batch'; sql: string[] }[] = [];
-    const stmt = (sql: string) => {
-      const s = {
-        sql,
-        bind: () => s,
-        // Every rowid probe sees one row dated 2026-09-29, so the open date has
-        // snapshots and every earlier date has none.
-        first: async () => ({ id: 1, service_date: '2026-09-29' }),
-        run: async () => {
-          calls.push({ kind: 'run', sql: [sql] });
-          return { meta: { changes: 0 } };
-        },
-      };
-      return s;
-    };
-    const db = {
-      prepare: stmt,
-      batch: async (stmts: { sql: string }[]) => {
-        calls.push({ kind: 'batch', sql: stmts.map((s) => s.sql) });
-        if (failBatch) throw new Error('D1_ERROR: exceeded daily row read limit');
-        return stmts.map(() => ({ meta: { changes: 1 } }));
+/**
+ * A stand-in for D1 that records how statements reach it and answers the rowid
+ * probes from a fixed list of (id, service_date) rows — one per date given.
+ */
+function fakeDb(opts: { dates: string[]; folded?: string[]; failBatch?: boolean }) {
+  const rows = opts.dates.map((d, i) => ({ id: (i + 1) * 10, service_date: d }));
+  const calls: { kind: 'run' | 'batch'; sql: string[] }[] = [];
+  const stmt = (sql: string) => {
+    let bound: unknown[] = [];
+    const s = {
+      sql,
+      bind: (...b: unknown[]) => {
+        bound = b;
+        return s;
+      },
+      first: async () => {
+        if (sql.includes('ORDER BY id ASC LIMIT 1')) return rows[0] ?? null;
+        if (sql.includes('ORDER BY id DESC LIMIT 1')) return rows[rows.length - 1] ?? null;
+        if (sql.includes('WHERE id >= ?')) return rows.find((r) => r.id >= Number(bound[0])) ?? null;
+        return null;
+      },
+      all: async () => ({
+        results: sql.includes('FROM rollup_grid_folded')
+          ? (opts.folded ?? []).map((d) => ({ service_date: d }))
+          : [],
+      }),
+      run: async () => {
+        calls.push({ kind: 'run', sql: [sql] });
+        return { meta: { changes: 0 } };
       },
     };
-    return { env: { DB: db } as unknown as Parameters<typeof runRollup>[0], calls };
-  }
+    return s;
+  };
+  const db = {
+    prepare: stmt,
+    batch: async (stmts: { sql: string }[]) => {
+      calls.push({ kind: 'batch', sql: stmts.map((x) => x.sql) });
+      if (opts.failBatch) throw new Error('D1_ERROR: exceeded daily row read limit');
+      return stmts.map(() => ({ meta: { changes: 1, rows_read: 100_000 } }));
+    },
+  };
+  return { env: { DB: db } as unknown as Parameters<typeof runRollup>[0], calls };
+}
 
+const AUG = Array.from({ length: 19 }, (_, i) => `2026-08-${String(i + 1).padStart(2, '0')}`);
+const LATE_SEPT = ['2026-09-28', '2026-09-29', '2026-09-30', '2026-10-01'];
+// 04:00 EDT on 2026-10-01: open date 2026-10-01, newest final date 2026-09-29.
+const OCT1 = Date.parse('2026-10-01T08:00:00Z');
+
+describe('runRollup atomicity', () => {
   it('never runs a DELETE outside a batch', async () => {
-    const { env, calls } = fakeDb(false);
-    await runRollup(env, Date.parse('2026-09-29T08:00:00Z'));
+    const { env, calls } = fakeDb({ dates: [...AUG, ...LATE_SEPT] });
+    await runRollup(env, OCT1);
     expect(calls.filter((c) => c.kind === 'run' && /DELETE/.test(c.sql[0]))).toEqual([]);
   });
 
-  it("puts each DELETE first in the same batch as its table's INSERT", async () => {
-    const { env, calls } = fakeDb(false);
-    await runRollup(env, Date.parse('2026-09-29T08:00:00Z'));
+  it("puts each by_day DELETE first in the same batch as that date's INSERT", async () => {
+    const { env, calls } = fakeDb({ dates: [...AUG, ...LATE_SEPT] });
+    await runRollup(env, OCT1, { fold: false });
     const batches = calls.filter((c) => c.kind === 'batch');
-    // One per recomputed by_day date (only 2026-09-29 has rows here), then the grid.
-    expect(batches).toHaveLength(2);
-    expect(batches[0].sql[0]).toContain('DELETE FROM rollup_error_by_day WHERE service_date = ?');
-    expect(batches[0].sql[1]).toContain('INSERT INTO rollup_error_by_day');
-    expect(batches[1].sql[0]).toContain('DELETE FROM rollup_error_by_slice');
-    expect(batches[1].sql[1]).toContain('INSERT INTO rollup_error_by_slice');
-    for (const b of batches) expect(b.sql).toHaveLength(2);
+    expect(batches).toHaveLength(3); // 09-29, 09-30, 10-01
+    for (const b of batches) {
+      expect(b.sql).toHaveLength(2);
+      expect(b.sql[0]).toContain('DELETE FROM rollup_error_by_day WHERE service_date = ?');
+      expect(b.sql[1]).toContain('INSERT INTO rollup_error_by_day');
+    }
   });
 
-  it('reports the failure and stops, rather than moving on to the next table', async () => {
-    const { env, calls } = fakeDb(true);
-    const stats = await runRollup(env, Date.parse('2026-09-29T08:00:00Z'));
+  it('reports the failure and stops, rather than moving on', async () => {
+    const { env, calls } = fakeDb({ dates: [...AUG, ...LATE_SEPT], failBatch: true });
+    const stats = await runRollup(env, OCT1);
     expect(stats.error).toMatch(/read limit/);
     expect(calls.filter((c) => c.kind === 'batch')).toHaveLength(1);
   });
@@ -238,39 +255,82 @@ describe('ROLLUP_FLOOR', () => {
     expect(ROLLUP_FLOOR).toBe('2026-09-28');
   });
 
-  it('never recomputes a date before the floor, even when asked', async () => {
-    const calls: string[] = [];
-    const stmt = (sql: string) => {
-      const s = { sql, bind: () => s, first: async () => ({ id: 1, service_date: '2026-09-29' }) };
-      return s;
-    };
-    const db = {
-      prepare: stmt,
-      batch: async (stmts: { sql: string }[]) => {
-        calls.push(...stmts.map((x) => x.sql));
-        return stmts.map(() => ({ meta: { changes: 0 } }));
-      },
-    };
-    const env = { DB: db } as unknown as Parameters<typeof runRollup>[0];
-    const stats = await runRollup(env, Date.parse('2026-09-29T08:00:00Z'), {
-      byDayDates: ['2026-09-08', '2026-09-27'],
-      slice: false,
-    });
+  it('never recomputes a by_day date before the floor, even when asked', async () => {
+    const { env, calls } = fakeDb({ dates: [...AUG, ...LATE_SEPT] });
+    const stats = await runRollup(env, OCT1, { byDayDates: ['2026-09-08', '2026-09-27'], fold: false });
     expect(stats.skipped_dates).toEqual(['2026-09-08', '2026-09-27']);
     expect(stats.by_day_dates).toEqual([]);
     expect(calls).toEqual([]);
   });
+});
 
-  it('starts the grid window at the floor until 7 days have accumulated', async () => {
-    const db = {
-      prepare: (sql: string) => {
-        const s = { sql, bind: () => s, first: async () => ({ id: 1, service_date: '2026-09-28' }) };
-        return s;
-      },
-      batch: async (stmts: unknown[]) => stmts.map(() => ({ meta: { changes: 0 } })),
-    };
-    const env = { DB: db } as unknown as Parameters<typeof runRollup>[0];
-    const stats = await runRollup(env, Date.parse('2026-09-30T08:00:00Z'), { byDayDates: [] });
-    expect(stats.slice_window).toEqual({ from: '2026-09-28', to: '2026-09-30' });
+describe('grid fold eligibility', () => {
+  const { eligibleFoldDates } = __test;
+
+  it('is the August backfill, then the floor up to two days before the open date', () => {
+    const d = eligibleFoldDates('2026-10-01', new Set());
+    expect(d.slice(0, 19)).toEqual(AUG);
+    expect(d.slice(19)).toEqual(['2026-09-28', '2026-09-29']);
+  });
+
+  it('never includes the degraded dates between the backfill and the floor', () => {
+    const d = eligibleFoldDates('2026-12-01', new Set());
+    expect(d.filter((x) => x > GRID_BACKFILL.to && x < ROLLUP_FLOOR)).toEqual([]);
+  });
+
+  it('never includes a date that is not yet final', () => {
+    expect(eligibleFoldDates('2026-10-01', new Set())).not.toContain('2026-09-30');
+  });
+
+  it('skips dates already folded', () => {
+    const d = eligibleFoldDates('2026-10-01', new Set(AUG.slice(0, 10)));
+    expect(d[0]).toBe('2026-08-11');
+  });
+});
+
+describe('grid fold', () => {
+  const { foldSql } = __test;
+
+  it('adds to existing cells rather than replacing them — sums and counts merge exactly', () => {
+    const sql = foldSql(R, '2026-09-27', 1);
+    expect(sql).toContain('n           = n + excluded.n');
+    expect(sql).toContain('sum_err     = sum_err + excluded.sum_err');
+    expect(sql).toContain('sum_abs_err = sum_abs_err + excluded.sum_abs_err');
+    expect(sql).toContain('n_within_60 = n_within_60 + excluded.n_within_60');
+  });
+
+  it('refuses a date that is already marked folded, inside the statement itself', () => {
+    expect(foldSql(R, '2026-09-27', 1)).toContain(
+      "WHERE NOT EXISTS (SELECT 1 FROM rollup_grid_folded WHERE service_date = '2026-09-27')",
+    );
+  });
+
+  it('writes the marker in the same batch as the fold', async () => {
+    const { env, calls } = fakeDb({ dates: [...AUG, ...LATE_SEPT] });
+    await runRollup(env, OCT1, { byDayDates: [], foldDates: ['2026-08-01'] });
+    const foldBatch = calls.find((c) => c.kind === 'batch' && c.sql[0].includes('INSERT INTO rollup_grid_totals'))!;
+    expect(foldBatch.sql[1]).toContain('INSERT OR IGNORE INTO rollup_grid_folded');
+  });
+
+  it('folds at most ten dates per run, oldest first, and reports the rest as pending', async () => {
+    const { env } = fakeDb({ dates: [...AUG, ...LATE_SEPT] });
+    const stats = await runRollup(env, OCT1, { byDayDates: [] });
+    expect(stats.grid_folded).toEqual(AUG.slice(0, 10));
+    expect(stats.grid_pending).toBe(11); // Aug 11-19, 09-28, 09-29
+  });
+
+  it('stops for the night once the account read total reaches the guard', async () => {
+    const { env } = fakeDb({ dates: [...AUG, ...LATE_SEPT] });
+    // Each fake fold reads 100k; starting at 1.75M, the guard (2.0M) trips after three.
+    const stats = await runRollup(env, OCT1, { byDayDates: [], readsBefore: 1_750_000 });
+    expect(stats.grid_folded).toHaveLength(3);
+    expect(stats.grid_stopped_by_budget).toBe(true);
+  });
+
+  it('folds nothing already folded', async () => {
+    const { env } = fakeDb({ dates: [...AUG, ...LATE_SEPT], folded: [...AUG, '2026-09-28', '2026-09-29'] });
+    const stats = await runRollup(env, OCT1, { byDayDates: [] });
+    expect(stats.grid_folded).toEqual([]);
+    expect(stats.grid_pending).toBe(0);
   });
 });

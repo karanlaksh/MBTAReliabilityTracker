@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { __test } from '../src/api';
 
-const { readFilters, whereClause, BUCKET_ORDER, BUCKET_HORIZON, round1, safeParse } = __test;
+const { readFilters, whereClause, BUCKET_ORDER, BUCKET_HORIZON, round1, safeParse, estimateGateOpen } = __test;
 const url = (qs: string) => new URL(`https://x.dev/api/error-by-horizon${qs}`);
 
 describe('filter defaults', () => {
@@ -76,5 +76,41 @@ describe('helpers', () => {
     expect(safeParse('["Orange","39"]')).toEqual(['Orange', '39']);
     expect(safeParse('not json')).toEqual([]);
     expect(safeParse(null)).toEqual([]);
+  });
+});
+
+describe('estimateGateOpen', () => {
+  const gate = { minN: 20, minCoverage: 0.6, minMeanN: 20 };
+  // One folded date per weekday, 2026-09-28 (Mon) .. 2026-10-04 (Sun).
+  const week = ['2026-09-28', '2026-09-29', '2026-09-30', '2026-10-01', '2026-10-02', '2026-10-03', '2026-10-04'];
+
+  it('declines to estimate until every weekday has a folded date', () => {
+    const r = estimateGateOpen([{ weekday: 1, n: 5 }], week.slice(0, 6), gate);
+    expect(r.date).toBeNull();
+    expect(r.basis).toMatch(/every weekday/);
+  });
+
+  it('extrapolates each cell at its own weekday rate', () => {
+    // n = 5 per cell after one week each: 3 more weeks to reach 20.
+    const cells = Array.from({ length: 7 }, (_, w) => ({ weekday: w, n: 5 }));
+    const r = estimateGateOpen(cells, week, gate);
+    expect(r.weeks).toBe(3);
+    // Newest folded date + 3 weeks + the two-day fold lag.
+    expect(r.date).toBe('2026-10-27');
+  });
+
+  it('waits for the slower of the coverage gate and the mean gate', () => {
+    // 60% of cells already pass, but the mean is dragged down by quiet cells.
+    const cells = [
+      ...Array.from({ length: 6 }, () => ({ weekday: 1, n: 30 })),
+      ...Array.from({ length: 4 }, () => ({ weekday: 1, n: 1 })),
+    ];
+    const r = estimateGateOpen(cells, week, gate);
+    expect(r.weeks).toBeGreaterThan(0); // coverage met now; mean (18.4) is not
+  });
+
+  it('reports no date once the gate is already met', () => {
+    const cells = Array.from({ length: 7 }, (_, w) => ({ weekday: w, n: 25 }));
+    expect(estimateGateOpen(cells, week, gate)).toMatchObject({ date: null, weeks: 0 });
   });
 });

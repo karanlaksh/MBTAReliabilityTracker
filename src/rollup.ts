@@ -1,11 +1,14 @@
 // Build step 5: rollup tables.
 //
-// Two tables, both RECOMPUTED rather than patched, but over BOUNDED ranges:
-// rollup_error_by_day one service date at a time (recent dates on schedule, old
-// ones only on request, never before ROLLUP_FLOOR), rollup_error_by_slice over
-// a rolling 7-day window. Until 2026-09-28 both were recomputed over all
-// history, ~20-30M rows read per run against a 5M/day limit. See the staleness
-// policy in the README for why recompute rather than incremental patching.
+// Two tables, maintained two different ways on purpose:
+//   rollup_error_by_day   RECOMPUTED one service date at a time over a bounded
+//                         rowid range (the open date and two before it; never
+//                         before ROLLUP_FLOOR). Medians do not compose, so a date
+//                         is rebuilt rather than patched.
+//   rollup_grid_totals    ACCUMULATED: each final date is folded in once as sums
+//                         and counts, which merge exactly (migration 0011).
+// Until 2026-09-28 both were recomputed over all history, ~20-30M rows read per
+// run against a 5M/day limit. See the README staleness policy.
 //
 // All aggregation happens inside D1 as INSERT ... SELECT. Nothing streams through
 // the Worker: we already hit "Worker exceeded CPU time limit" on the backfill path
@@ -41,10 +44,37 @@ const RECOMPUTE_LOCAL_HOUR = 4;
 const BY_DAY_RECENT_DAYS = 3;
 
 /**
- * Days of data behind the typical-week grid. Sized by measured cost, not by
- * preference — see the README rollup cost table.
+ * THE TYPICAL-WEEK GRID ACCUMULATES; it is not recomputed. Each final service
+ * date is folded into rollup_grid_totals exactly once, as sums and counts that
+ * merge without approximation (migration 0011). Medians could not do this, which
+ * is why the grid used to be a rolling 7-day window that could never fill.
+ *
+ * A date is folded once it is final: two days after it closes, past the matcher's
+ * settlement and the by_day recompute window. The grid therefore trails the day
+ * series by two days, which does not matter for a weekly pattern.
  */
-export const SLICE_WINDOW_DAYS = 7;
+const GRID_FINAL_AFTER_DAYS = 2;
+
+/**
+ * The one exception to ROLLUP_FLOOR: August's complete days, folded into the grid
+ * once so the weekly pattern starts from the most complete data rather than from
+ * zero on 2026-09-28. Only the grid; rollup_error_by_day is not recomputed.
+ */
+export const GRID_BACKFILL = { from: '2026-08-01', to: '2026-08-19' } as const;
+
+/**
+ * At most this many dates per run. Measured: ~112k rows read per 30k-snapshot
+ * date, so ten August dates is ~1.0M — about one night's spare read budget.
+ */
+const GRID_FOLD_MAX_PER_RUN = 10;
+
+/**
+ * Stop folding for the night once the ACCOUNT has read this many rows in the UTC
+ * day (usage before the run + this run so far). Leaves ~1M for the ~16h still to
+ * run after 04:00 ET, keeping the day under ~60% of the 5M limit. Remaining dates
+ * fold the next night.
+ */
+const GRID_FOLD_STOP_AT_READS = 2_000_000;
 
 /**
  * No service date before this is ever recomputed, on schedule or by hand.
@@ -57,7 +87,6 @@ export const SLICE_WINDOW_DAYS = 7;
 export const ROLLUP_FLOOR = '2026-09-28';
 
 export interface RollupStats {
-  by_slice_rows: number;
   by_day_rows: number;
   /** Rows inserted. Deletes also cost writes and are not counted here. */
   rows_written: number;
@@ -66,7 +95,13 @@ export interface RollupStats {
   by_day_dates: string[];
   /** Requested dates left untouched: before ROLLUP_FLOOR, or no snapshots. */
   skipped_dates: string[];
-  slice_window: { from: string; to: string } | null;
+  /** Dates folded into rollup_grid_totals by this run. */
+  grid_folded: string[];
+  /** Grid cells inserted or updated by those folds. */
+  grid_cells_touched: number;
+  /** Eligible dates left for a later run — by the per-run cap or the read guard. */
+  grid_pending: number;
+  grid_stopped_by_budget: boolean;
   partial_dates: string[];
   duration_ms: number;
   error: string | null;
@@ -271,6 +306,77 @@ export function addDays(d: string, n: number): string {
   return new Date(t).toISOString().slice(0, 10);
 }
 
+/** Every ISO date from `from` to `to`, inclusive. Empty if from > to. */
+function datesBetween(from: string, to: string): string[] {
+  const out: string[] = [];
+  for (let d = from; d <= to; d = addDays(d, 1)) out.push(d);
+  return out;
+}
+
+/**
+ * Dates the grid may fold, oldest first: the August backfill, then every date
+ * from ROLLUP_FLOOR up to the newest FINAL date (GRID_FINAL_AFTER_DAYS before
+ * the open one) — minus any already folded. Nothing between the backfill and the
+ * floor is ever eligible: those are the degraded September dates.
+ */
+export function eligibleFoldDates(openDate: string, folded: Set<string>): string[] {
+  const lastFinal = addDays(openDate, -GRID_FINAL_AFTER_DAYS);
+  const backfill = datesBetween(GRID_BACKFILL.from, GRID_BACKFILL.to < lastFinal ? GRID_BACKFILL.to : lastFinal);
+  const recent = datesBetween(ROLLUP_FLOOR, lastFinal);
+  return [...backfill, ...recent].filter((d) => !folded.has(d));
+}
+
+/**
+ * The INSERT that adds one date's sums and counts to the grid.
+ *
+ * Refuses outright if the date already has a marker in rollup_grid_folded: the
+ * guard is inside the statement, and the marker is written in the same
+ * transaction, so a retry, an overlapping run, or a manual re-fold adds zero.
+ */
+function foldSql(r: SnapshotRange, d: string, now: number): string {
+  return `
+    INSERT INTO rollup_grid_totals
+      (stop_id, route_id, direction_id, weekday, hour, horizon_bucket, is_added,
+       n, sum_err, sum_abs_err, n_within_60, updated_at)
+    SELECT stop_id, route_id, direction_id, weekday, hour, horizon_bucket, is_added,
+           COUNT(*), SUM(err), SUM(ABS(err)),
+           SUM(CASE WHEN ABS(err) <= 60 THEN 1 ELSE 0 END), ${int(now)}
+      FROM (${gradedSql(r)})
+     WHERE NOT EXISTS (SELECT 1 FROM rollup_grid_folded WHERE service_date = '${date(d)}')
+     GROUP BY stop_id, route_id, direction_id, weekday, hour, horizon_bucket, is_added
+    ON CONFLICT (stop_id, route_id, direction_id, weekday, hour, horizon_bucket, is_added)
+    DO UPDATE SET
+      n           = n + excluded.n,
+      sum_err     = sum_err + excluded.sum_err,
+      sum_abs_err = sum_abs_err + excluded.sum_abs_err,
+      n_within_60 = n_within_60 + excluded.n_within_60,
+      updated_at  = excluded.updated_at`;
+}
+
+/**
+ * Fold one final service date into the grid: the upsert and its marker in one
+ * db.batch(), which D1 runs as a transaction. A date with no snapshots still gets
+ * a marker, so it is not retried every night.
+ */
+async function foldDate(
+  db: D1Database,
+  d: string,
+  now: number,
+): Promise<{ rows_read: number; cells: number }> {
+  const range = await snapshotRange(db, d, d);
+  const marker = db
+    .prepare('INSERT OR IGNORE INTO rollup_grid_folded (service_date, folded_at, rows_read) VALUES (?, ?, NULL)')
+    .bind(d, now);
+  if (range === null || (range.hiId !== null && range.hiId <= range.loId)) {
+    await db.batch([marker]);
+    return { rows_read: 0, cells: 0 };
+  }
+  const [fold] = await db.batch([db.prepare(foldSql(range, d, now)), marker]);
+  const rowsRead = fold.meta?.rows_read ?? 0;
+  await db.prepare('UPDATE rollup_grid_folded SET rows_read = ? WHERE service_date = ?').bind(rowsRead, d).run();
+  return { rows_read: rowsRead, cells: fold.meta?.changes ?? 0 };
+}
+
 /**
  * Percentiles by ordinal rank. SQLite has no percentile aggregate, so rank within
  * each group and pick. Every group also carries n — nothing in this project
@@ -305,8 +411,16 @@ export interface RollupOptions {
    * dropped, and reported in skipped_dates.
    */
   byDayDates?: string[];
-  /** Rebuild rollup_error_by_slice over its window. Default true. */
-  slice?: boolean;
+  /** Fold eligible dates into the grid. Default true. */
+  fold?: boolean;
+  /** Fold exactly these dates (manual route). Each must still be eligible. */
+  foldDates?: string[];
+  /**
+   * Account rows read so far this UTC day, from Cloudflare analytics. The fold
+   * stops once this plus the run's own reads reaches GRID_FOLD_STOP_AT_READS.
+   * Omitted (manual runs), only the run's own reads count.
+   */
+  readsBefore?: number;
 }
 
 export async function runRollup(
@@ -316,13 +430,15 @@ export async function runRollup(
 ): Promise<RollupStats> {
   const now = Math.floor(startedAtMs / 1000);
   const stats: RollupStats = {
-    by_slice_rows: 0,
     by_day_rows: 0,
     rows_written: 0,
     rows_read: 0,
     by_day_dates: [],
     skipped_dates: [],
-    slice_window: null,
+    grid_folded: [],
+    grid_cells_touched: 0,
+    grid_pending: 0,
+    grid_stopped_by_budget: false,
     partial_dates: [],
     duration_ms: 0,
     error: null,
@@ -393,38 +509,31 @@ export async function runRollup(
       stats.by_day_dates.push(d);
     }
 
-    // --- table 1: the typical-week grid, over a bounded window -------------
-    // It has no date dimension, so it cannot be patched a date at a time, and
-    // medians do not compose: every run recomputes the whole window. The window
-    // is therefore what bounds the cost — see SLICE_WINDOW_DAYS.
-    if (opts.slice !== false) {
-      const windowStart = addDays(openDate, -(SLICE_WINDOW_DAYS - 1));
-      const from = windowStart > ROLLUP_FLOOR ? windowStart : ROLLUP_FLOOR;
-      const range = await snapshotRange(env.DB, from, openDate);
-      if (range !== null) {
-        stats.slice_window = { from, to: openDate };
-        const sliceCols = ['stop_id', 'route_id', 'direction_id', 'weekday', 'hour', 'is_added'];
-        const results = await env.DB.batch([
-          env.DB.prepare('DELETE FROM rollup_error_by_slice'),
-          env.DB.prepare(
-              `INSERT INTO rollup_error_by_slice
-                 (stop_id, route_id, direction_id, weekday, hour, horizon_bucket, is_added,
-                  n, mean_error_sec, median_error_sec, p10_error_sec, p90_error_sec,
-                  pct_within_60s, computed_at)
-               SELECT stop_id, route_id, direction_id, weekday, hour, horizon_bucket, is_added,
-                      n, mean_error_sec, median_error_sec, p10_error_sec, p90_error_sec,
-                      pct_within_60s, ${now}
-                 FROM (${statsSql(sliceCols, range)})`,
-            ),
-        ]);
-        for (const [i, res] of results.entries()) {
-          stats.rows_read += res.meta?.rows_read ?? 0;
-          if (i > 0) stats.by_slice_rows += res.meta?.changes ?? 0;
+    // --- the typical-week grid: fold final dates, once each -----------------
+    if (opts.fold !== false) {
+      const folded = new Set(
+        ((await env.DB.prepare('SELECT service_date FROM rollup_grid_folded').all<{ service_date: string }>())
+          .results ?? []).map((r) => r.service_date),
+      );
+      const eligible = eligibleFoldDates(openDate, folded);
+      const queue = opts.foldDates ? eligible.filter((d) => opts.foldDates!.includes(d)) : eligible;
+      let done = 0;
+      for (const d of queue) {
+        if (done >= GRID_FOLD_MAX_PER_RUN) break;
+        if ((opts.readsBefore ?? 0) + stats.rows_read >= GRID_FOLD_STOP_AT_READS) {
+          stats.grid_stopped_by_budget = true;
+          break;
         }
+        const res = await foldDate(env.DB, d, now);
+        stats.rows_read += res.rows_read;
+        stats.grid_cells_touched += res.cells;
+        stats.grid_folded.push(d);
+        done++;
       }
+      stats.grid_pending = queue.length - done;
     }
 
-    stats.rows_written = stats.by_slice_rows + stats.by_day_rows;
+    stats.rows_written = stats.by_day_rows + stats.grid_cells_touched;
   } catch (err) {
     stats.error = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
     console.error('rollup failed', stats.error);
@@ -451,4 +560,4 @@ export function shouldRecompute(now: number, minuteOfHour: number): boolean {
   return localHour(now) === RECOMPUTE_LOCAL_HOUR && minuteOfHour < 15;
 }
 
-export const __test = { BUCKETS, shouldRecompute, gradedSql, statsSql, findDateStartId, addDays };
+export const __test = { BUCKETS, shouldRecompute, gradedSql, statsSql, findDateStartId, addDays, eligibleFoldDates, foldSql };

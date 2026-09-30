@@ -50,6 +50,17 @@ Every index adds an extra written row whenever an indexed column is written.
   scan. Do not add an index to it without recalculating the write budget.
 - The prediction error is **never stored**. It is a pure function of a snapshot and an
   arrival, computed at rollup time.
+- **The typical-week grid uses composable statistics so that rule can hold.** Each cell
+  keeps only `n`, Σ error, Σ |error| and the count within 60s (`rollup_grid_totals`,
+  migration 0011). Sums and counts merge exactly, so each final service date is folded in
+  once and the grid accumulates forever without storing a per-prediction row. Medians
+  cannot do this — a median cell must be recomputed from every prediction behind it, which
+  the read budget limited to a rolling 7 days, which meant the grid could never fill. This
+  is a design decision, not an implementation detail: it is the reason the grid displays
+  **share within 60s** (exact, outlier-resistant) rather than a median, and the reason no
+  error column exists. Storing per-prediction error remains a separate decision for the
+  November work — a convenience there, not a prerequisite, since features and outcomes
+  are already in `prediction_snapshots` and `arrivals`.
 - Dedup state is **one JSON row** in `collector_state`, not a table of rows and not
   Workers KV (KV free tier allows 1,000 writes/day; the cron runs 1,440 times/day).
 

@@ -388,21 +388,57 @@ or restrict long-horizon analysis to scheduled (non-`ADDED`) trips where coverag
 
 ## Rollups (step 5)
 
-Two tables, both **recomputed rather than patched, over bounded ranges**, at 04:00 local:
-`rollup_error_by_day` for the open service date and the two before it, and
-`rollup_error_by_slice` over a rolling **7-day window**. Until 2026-09-28 both were
-recomputed over all history, which is what made them unaffordable — see *Read cost*
-below and the incident section.
+Two tables, maintained two different ways on purpose, at 04:00 local:
+
+- **`rollup_error_by_day` is recomputed**, one service date at a time over a bounded rowid
+  range: the open date and the two before it. Its medians do not compose, so a date is
+  rebuilt rather than patched.
+- **`rollup_grid_totals` accumulates.** Each final service date is folded in once, as sums
+  and counts that merge exactly (see *The typical-week grid* below).
+
+Until 2026-09-28 both were recomputed over all history, which is what made them
+unaffordable — see *Read cost* below and the incident section.
 
 **Nothing before 2026-09-28 is ever recomputed** (`ROLLUP_FLOOR` in `src/rollup.ts`). The
 September dates are degraded and not summarised; the pre-rewrite `rollup_error_by_day` rows
 through 2026-09-08 are left exactly as they are. `POST /rollup?date=YYYY-MM-DD` recomputes one
 date on request and refuses dates before the floor.
 
-**`rollup_error_by_slice`** — stop x route x direction x weekday x hour x bucket x is_added.
-Bounded cardinality (~11,200 cells) no matter how many days accumulate. Currently 5,834
-cells at a **mean n of 7**, with only 88 cells reaching n>=20 — far too sparse to display.
-Populated now anyway so the schema does not change once it is dense enough to be useful.
+**The typical-week grid (`rollup_grid_totals`)** — stop x route x direction x weekday x
+hour x bucket x is_added. Bounded cardinality (~11,200 possible cells) however many days
+accumulate.
+
+**It stores composable statistics so it can accumulate without storing per-prediction
+error.** A cell holds only `n`, Σ signed error, Σ |error| and the count within 60s. Sums and
+counts merge with no approximation, so a final service date is folded in **once** — two days
+after it closes, past matcher settlement — and never re-read. This is a design decision,
+recorded in CLAUDE.md: it is why the "prediction error is never stored" rule still holds.
+
+The grid it replaced (`rollup_error_by_slice`) held medians, which do not compose. A median
+cell can only be recomputed from every prediction behind it; the read budget limited that to
+a rolling 7 days, which gave each cell about one day of data (mean n 7), so the display gate
+(60% of cells at n >= 20) could never open.
+
+**Displayed value: share of predictions within 60 seconds.** Exact, resistant to outliers,
+and readable without a footnote — "4 in 10 predictions at Ruggles at 8am are within a
+minute". It is not a central-tendency statistic, so it does not sit awkwardly beside the
+headline medians. Mean signed error and mean absolute error are stored but not displayed;
+recovering them later would mean re-reading every folded date. What a mean gives up versus a
+median — outlier resistance, on errors this right-skewed (Bus 39 at ~16 min: median +116s,
+p90 +369s) — is why neither is the displayed value.
+
+**Folding is idempotent and atomic.** The upsert and a marker row in `rollup_grid_folded`
+commit in one `db.batch()`, and the upsert refuses any date that already has a marker, so a
+retry or a manual re-fold adds zero. Measured locally at production scale: after two
+simulated nights (20 dates), **3,528 of 3,528 cells matched a direct computation exactly**
+(n, Σ error, Σ |error|, within-60s count), and re-folding a date changed nothing.
+
+**August 1–19 is folded in once**, the one exception to `ROLLUP_FLOOR` and only for the grid
+— `rollup_error_by_day` is not recomputed. August is the most complete data, and starting the
+weekly pattern from zero on Sept 28 would discard it. Cost: ~112k rows read per 30k-snapshot
+date (measured locally), ~2.0M for Aug 1–19 by sampling the real id ranges (~540k
+snapshots). Spread over two nights, at most ten dates per run, with the run stopping itself
+once the account passes 2.0M reads that UTC day, to keep each day under ~60% of the limit.
 
 **`rollup_error_by_day`** — service_date x stop x route x direction x bucket x is_added,
 ~55 rows/day. Exists because table 1 has no date dimension and therefore cannot express a
@@ -465,8 +501,10 @@ history* is what was dropped.
 recompute: **6,384 rows** (5,834 slice + 550 day), 5.1 seconds. The `DELETE` before each
 `INSERT` roughly doubles it, since deletes count against the quota too — a full recompute
 must remove cells that no longer have data, which an upsert cannot do. So ~12,800 writes.
-Since the bounded rewrite a run inserts less — measured locally with a full 7-day window,
-72 day rows + 3,696 grid rows — so ~7,500 writes a day including the deletes.
+Since the rewrite a normal run writes far less: three `by_day` dates (~72 rows, plus their
+deletes) and one grid fold (~500–900 cell upserts in production, 528 locally) — about 1,100
+writes a day. The 7-day median grid it replaced rewrote ~3,700 cells and deleted as many,
+every day.
 
 | cadence | writes/day | vs the 100,000/day cap |
 |---|---:|---|
@@ -501,8 +539,9 @@ Measured locally at production scale (960k snapshots, ~30k per service date), wi
 | run | unbounded (committed until 2026-09-28) | per-bucket, bounded | **shipped** |
 |---|---:|---:|---:|
 | one `by_day` date | 16.3M | 540k | **178k** |
-| 7-day grid | — | 3.65M | **1.21M** |
-| scheduled run (3 dates + grid) | ~20–30M (remote, measured) | 5.27M | **1.75M** |
+| 7-day median grid (since replaced) | — | 3.65M | 1.21M |
+| **grid fold, one date (accumulating grid)** | — | — | **112k** |
+| scheduled run (3 dates + grid) | ~20–30M (remote, measured) | 5.27M | 1.75M → **~0.6M** with the fold |
 
 **Output is unchanged.** On the same data the committed SQL and the shipped SQL were diffed
 row for row — 48 of 48 day rows and 982 of 982 grid rows identical, with ADDED trips,
@@ -510,9 +549,12 @@ late-entering trips, NULL predictions and id gaps in the data. One intentional d
 snapshots of one (trip, stop) with the same stored `horizon_sec` now resolve to the earlier
 `predicted_arrival`; `ROW_NUMBER()` left that tie arbitrary.
 
-**Measured on the shipped code** with a fixed clock: the first scheduled run
-(2026-09-29, one full day in the grid) read **702k**; once the 7-day window is full,
-**1.75M**. The Sept 8 rows were untouched and no pre-floor date was recomputed.
+**Measured on production.** The 08:00 UTC hour on 2026-09-30, which contains the scheduled
+rollup along with that hour's collector and matcher runs (~36k/hour on their own), read
+292k rows. The first full UTC day after the fix (2026-09-29) read **1,344,842 rows (26.9%)**,
+including one-time costs at its start — the last run of the old matcher (239k) and the
+migrations (375k). On the two August backfill nights the grid fold adds ~1M: measured
+locally at 1.66M for a whole run with ten full dates.
 
 **Gated on the account's read total.** The scheduled run fetches Cloudflare's own count and
 runs only if at most 1.5M rows have been read so far that UTC day — and never when that count
@@ -523,12 +565,10 @@ costs the rest of the day's collection, which is not.
 code ran the `DELETE` as its own statement; when the `INSERT`s hit the read limit the delete
 had already committed, which is why `rollup_error_by_slice` was found **empty**.
 
-**The grid window is a real limitation.** A typical-week grid needs months of data; a 7-day
-window cannot reach the display gate in `web/components/SliceGrid.tsx`, so the grid is
-correct but stays hidden. Recomputing medians over months each day does not fit the read
-budget, and medians do not compose across days. Rendering it needs a composable store
-(e.g. per-prediction graded errors, written once) — a change to the "error is never stored"
-decision in CLAUDE.md, so not made here. `/api/error-by-slice` reports `window_days`.
+**When the grid appears.** `/api/error-by-slice` estimates it: each cell's rate is its `n`
+divided by the folded dates of its weekday, extrapolated until 60% of cells reach n >= 20 and
+the mean reaches 20. It assumes future dates resemble the folded ones, says so, and gives no
+date until every weekday has at least one folded date. The page shows that estimate.
 
 **In-progress days are marked, not silently included.** `rollup_error_by_day.is_partial = 1`
 for the open service date. Marking rather than exclusion keeps today queryable, but the flag

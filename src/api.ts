@@ -13,7 +13,6 @@
 // not the same statistic, so the field carries a `method` label saying so. The fix
 // is a route-grain pooled rollup, which is out of scope here.
 
-import { SLICE_WINDOW_DAYS } from './rollup';
 import type { Env } from './collector';
 
 /** Rollups recompute once daily at 04:00 local, so a 30-minute cache is generous. */
@@ -332,56 +331,117 @@ export async function summary(env: Env): Promise<Response> {
   });
 }
 
+/** Display gate for the grid, shared with the frontend's copy. */
+export const GRID_GATE = { minN: 20, minCoverage: 0.6, minMeanN: 20 } as const;
+
+interface GridCell {
+  weekday: number;
+  n: number;
+}
+
+/**
+ * When the grid's display gate should open, AT THE CURRENT RATE.
+ *
+ * Each cell gains data only from dates of its own weekday, so its rate is
+ * n / (folded dates with that weekday). From that, each cell's time to reach
+ * minN; the coverage gate opens when the minCoverage-th fraction of cells has
+ * reached it, and the mean gate when mean n reaches minMeanN. The estimate is the
+ * later of the two, counted from the newest folded date plus the two-day fold lag.
+ *
+ * Deliberately simple and stated as such: it assumes future dates look like the
+ * folded ones and that no new cells appear. Returns null until every weekday has
+ * at least one folded date — before that there is no rate to extrapolate.
+ */
+export function estimateGateOpen(
+  cells: GridCell[],
+  foldedDates: string[],
+  gate: { minN: number; minCoverage: number; minMeanN: number } = GRID_GATE,
+): { date: string | null; weeks: number | null; basis: string } {
+  const perWeekday = new Array(7).fill(0);
+  for (const d of foldedDates) perWeekday[new Date(`${d}T12:00:00Z`).getUTCDay()]++;
+  if (cells.length === 0 || perWeekday.some((c) => c === 0)) {
+    return { date: null, weeks: null, basis: 'not every weekday has a folded date yet' };
+  }
+  const rates = cells.map((c) => c.n / perWeekday[c.weekday]); // per week
+  const toMin = cells
+    .map((c, i) => (c.n >= gate.minN ? 0 : (gate.minN - c.n) / rates[i]))
+    .sort((x, y) => x - y);
+  const coverageWeeks = toMin[Math.min(toMin.length - 1, Math.ceil(gate.minCoverage * toMin.length) - 1)];
+  const meanN = cells.reduce((t, c) => t + c.n, 0) / cells.length;
+  const meanRate = rates.reduce((t, r) => t + r, 0) / rates.length;
+  const meanWeeks = meanN >= gate.minMeanN ? 0 : (gate.minMeanN - meanN) / meanRate;
+  const weeks = Math.max(coverageWeeks, meanWeeks);
+  const newest = [...foldedDates].sort().at(-1)!;
+  const t = Date.parse(`${newest}T12:00:00Z`) + Math.ceil(weeks * 7 + 2) * 86_400_000;
+  return {
+    date: weeks === 0 ? null : new Date(t).toISOString().slice(0, 10),
+    weeks: Number(weeks.toFixed(1)),
+    basis: 'at the current per-weekday rate, assuming future dates resemble the folded ones',
+  };
+}
+
 /**
  * GET /api/error-by-slice
  *
- * The typical-week grid: stop x weekday x hour x bucket. The query exists and is
- * correct; DISPLAY IS GATED ON SAMPLE SIZE and currently shows nothing, because
- * mean n per cell is 7 and only ~88 of 6,600 cells reach n>=20. It fills in over
- * months and turns itself on without a code change.
+ * The typical-week grid, from rollup_grid_totals: cells that accumulate across
+ * service dates as exact sums and counts (migration 0011). The displayed value is
+ * the share of predictions within 60 seconds; mean and mean absolute error are
+ * stored but not served until they are shown.
+ *
+ * Coverage counts scheduled service only (is_added = 0) in BOTH numerator and
+ * denominator: the grid never shows ADDED trips, so their cells must not dilute
+ * the gate.
  */
 export async function errorBySlice(env: Env, url: URL): Promise<Response> {
-  const minN = Math.max(1, Number(url.searchParams.get('min_n') ?? 20));
-  const { results } = await env.DB.prepare(
-    `SELECT stop_id, route_id, direction_id, weekday, hour, horizon_bucket, is_added,
-            n, median_error_sec, p90_error_sec
-       FROM rollup_error_by_slice
-      WHERE is_added = 0 AND n >= ?
-      ORDER BY n DESC LIMIT 500`,
-  )
-    .bind(minN)
-    .all<Record<string, number | string>>();
+  const minN = Math.max(1, Number(url.searchParams.get('min_n') ?? GRID_GATE.minN));
 
-  // cells_passing is counted separately, NOT taken from the returned array: the
-  // array is capped at 500 rows, so using its length would report 500 no matter
-  // how sparse the grid really was — and a display gate reading that number would
-  // open as soon as 500 cells qualified, which is 7.6% coverage.
-  const totals = await env.DB.prepare(
-    `SELECT COUNT(*) AS cells, CAST(AVG(n) AS INTEGER) AS mean_n,
-            SUM(CASE WHEN n >= ? AND is_added = 0 THEN 1 ELSE 0 END) AS passing
-       FROM rollup_error_by_slice`,
-  )
-    .bind(minN)
-    .first<{ cells: number; mean_n: number; passing: number }>();
+  // Bounded by the number of cells (~6k at most), not by history.
+  const [cellsRes, foldedRes] = await Promise.all([
+    env.DB.prepare(
+      `SELECT stop_id, route_id, direction_id, weekday, hour, horizon_bucket, n, n_within_60
+         FROM rollup_grid_totals WHERE is_added = 0`,
+    ).all<{
+      stop_id: string; route_id: string; direction_id: number; weekday: number;
+      hour: number; horizon_bucket: string; n: number; n_within_60: number;
+    }>(),
+    env.DB.prepare('SELECT service_date FROM rollup_grid_folded ORDER BY service_date').all<{
+      service_date: string;
+    }>(),
+  ]);
+  const cells = cellsRes.results ?? [];
+  const folded = (foldedRes.results ?? []).map((r) => r.service_date);
 
-  const cellsTotal = Number(totals?.cells ?? 0);
-  const passing = Number(totals?.passing ?? 0);
+  const passing = cells.filter((c) => c.n >= minN);
+  const meanN = cells.length ? cells.reduce((t, c) => t + c.n, 0) / cells.length : 0;
 
   return jsonResponse({
     min_n: minN,
-    cells_total: cellsTotal,
-    mean_n_per_cell: Number(totals?.mean_n ?? 0),
-    cells_passing: passing,
-    // The gate the client applies: what fraction of the grid is actually usable.
-    coverage: cellsTotal > 0 ? Number((passing / cellsTotal).toFixed(4)) : 0,
-    // The grid covers a rolling window, not all history: recomputing it over
-    // all history read ~10-15M rows (measured), 2-3x the 5M/day budget. A 7-day
-    // window cannot reach the display gate below, so the grid stays hidden
-    // until it is rebuilt on a composable store. Stated here so no consumer
-    // can present it as all-time.
-    window_days: SLICE_WINDOW_DAYS,
-    note: `rolling ${SLICE_WINDOW_DAYS}-day window, not all history; display is gated on coverage and mean n`,
-    cells: results ?? [],
+    metric: 'share_within_60s',
+    cells_total: cells.length,
+    mean_n_per_cell: Math.round(meanN),
+    cells_passing: passing.length,
+    coverage: cells.length ? Number((passing.length / cells.length).toFixed(4)) : 0,
+    gate: GRID_GATE,
+    accumulation: {
+      dates_folded: folded.length,
+      first: folded[0] ?? null,
+      last: folded.at(-1) ?? null,
+    },
+    estimate: estimateGateOpen(cells, folded),
+    note: 'accumulates across service dates as exact sums and counts; share within 60s is the displayed value',
+    cells: passing
+      .sort((x, y) => y.n - x.n)
+      .slice(0, 500)
+      .map((c) => ({
+        stop_id: c.stop_id,
+        route_id: c.route_id,
+        direction_id: c.direction_id,
+        weekday: c.weekday,
+        hour: c.hour,
+        horizon_bucket: c.horizon_bucket,
+        n: c.n,
+        share_within_60s: Number((c.n_within_60 / c.n).toFixed(4)),
+      })),
   });
 }
 
@@ -401,4 +461,12 @@ function safeParse(v: unknown): string[] {
   }
 }
 
-export const __test = { readFilters, whereClause, BUCKET_ORDER, BUCKET_HORIZON, round1, safeParse };
+export const __test = {
+  readFilters,
+  whereClause,
+  BUCKET_ORDER,
+  BUCKET_HORIZON,
+  round1,
+  safeParse,
+  estimateGateOpen,
+};

@@ -10,9 +10,9 @@ const MATCHER_CRON = '*/15 * * * *';
 
 /**
  * The scheduled rollup runs only if the account has read at most this many rows
- * so far today. 5M limit - ~1.75M measured rollup cost - the rest of the day's
- * matcher and collector reads leaves this with margin; at 04:00 local (08:00 UTC)
- * a healthy day has read well under it.
+ * so far today. A normal run is ~0.6M (three by_day dates + one grid fold); on
+ * the two August backfill nights the grid fold adds ~1M and stops itself at 2M
+ * account-wide. At 04:00 local (08:00 UTC) a healthy day has read ~0.3M.
  */
 const ROLLUP_MAX_READS_BEFORE = 1_500_000;
 
@@ -46,8 +46,8 @@ export default {
       //
       // BOUNDED, AND GATED ON THE READ BUDGET. The unbounded rollup read ~20-30M
       // rows (measured) against a 5M/day limit. This one recomputes three service
-      // dates and a 7-day grid through rowid ranges: ~1.75M reads measured at
-      // production scale. It still runs only if Cloudflare's own account total
+      // dates through rowid ranges and folds final dates into the accumulating
+      // grid: ~0.6M reads on a normal day. It still runs only if Cloudflare's own account total
       // says there is room, and never on an unknown — a rollup that exhausts the
       // budget costs the rest of the day's collection, which is unrecoverable,
       // while a skipped rollup is recomputed tomorrow.
@@ -60,7 +60,7 @@ export default {
           console.error('rollup skipped: read usage unavailable', String(err));
         }
         if (usage && usage.rows_read_today <= ROLLUP_MAX_READS_BEFORE) {
-          const roll = await runRollup(env, Date.now());
+          const roll = await runRollup(env, Date.now(), { readsBefore: usage.rows_read_today });
           if (roll.error) console.error('rollup failed', roll);
           else console.log('rollup', roll);
         } else if (usage) {
@@ -102,8 +102,10 @@ export default {
     //   ?date=YYYY-MM-DD  one service date of rollup_error_by_day, grid untouched.
     //                     Refused before ROLLUP_FLOOR: those dates are not
     //                     summarised, and their existing rows are left alone.
-    //   ?slice=only       the typical-week grid only
-    //   (neither)         what the schedule runs: recent dates + the grid
+    //   ?fold=YYYY-MM-DD  fold that one date into the grid, if it is eligible
+    //                     (final, not yet folded, and in the August backfill or
+    //                     at/after ROLLUP_FLOOR); by_day untouched.
+    //   (neither)         what the schedule runs: recent dates + pending folds
     // Every response carries rows_read, D1's own measurement of what it cost.
     if (url.pathname === '/rollup' && request.method === 'POST') {
       if (!env.COLLECT_TOKEN || url.searchParams.get('token') !== env.COLLECT_TOKEN) {
@@ -116,11 +118,15 @@ export default {
       if (date !== null && date < ROLLUP_FLOOR) {
         return json({ error: `dates before ${ROLLUP_FLOOR} are not summarised` }, 400);
       }
+      const fold = url.searchParams.get('fold');
+      if (fold !== null && !/^\d{4}-\d{2}-\d{2}$/.test(fold)) {
+        return json({ error: 'fold must be YYYY-MM-DD' }, 400);
+      }
       const opts =
         date !== null
-          ? { byDayDates: [date], slice: false }
-          : url.searchParams.get('slice') === 'only'
-            ? { byDayDates: [], slice: true }
+          ? { byDayDates: [date], fold: false }
+          : fold !== null
+            ? { byDayDates: [], foldDates: [fold] }
             : {};
       return json(await runRollup(env, Date.now(), opts));
     }
