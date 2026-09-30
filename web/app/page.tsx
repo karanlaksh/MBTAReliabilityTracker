@@ -1,4 +1,5 @@
 import CollectionStatus from '@/components/CollectionStatus';
+import DataAge from '@/components/DataAge';
 import DegradedBanner from '@/components/DegradedBanner';
 import Finding from '@/components/Finding';
 import Limitations from '@/components/Limitations';
@@ -15,16 +16,14 @@ import {
   type SummaryResponse,
 } from '@/lib/api';
 
-/** Rollups recompute once daily at 04:00 local; revalidate well inside that. */
+/**
+ * Backstop only. Time-based ISR is stale-while-revalidate: the first visit after
+ * the window expires is served the OLD page and merely triggers a rebuild, so on
+ * a rarely visited page it cannot keep the page current by itself. What keeps it
+ * current is app/api/revalidate, called by a daily Vercel cron after the 04:00 ET
+ * rollup. The page states its own data age either way (DataAge).
+ */
 export const revalidate = 1800;
-
-function ago(unix: number | null): string {
-  if (!unix) return 'unknown';
-  const mins = Math.round((Date.now() / 1000 - unix) / 60);
-  if (mins < 90) return `${mins} min ago`;
-  const hours = Math.round(mins / 60);
-  return hours < 48 ? `${hours} h ago` : `${Math.round(hours / 24)} days ago`;
-}
 
 export default async function Page() {
   // Fetched in parallel; each returns a value on failure rather than throwing, so
@@ -47,6 +46,13 @@ export default async function Page() {
 
   const series = horizon.data?.series ?? [];
 
+  // The OLDEST response this render used: the page is only as fresh as its
+  // stalest input.
+  const fetchedTimes = [horizon, days, summary, slices]
+    .map((r) => r.fetchedAt)
+    .filter((t): t is number => t !== null);
+  const fetchedAt = fetchedTimes.length ? Math.min(...fetchedTimes) : null;
+
   return (
     <main className="mx-auto max-w-5xl px-5 py-12 sm:px-8">
       <header className="mb-10">
@@ -66,24 +72,27 @@ export default async function Page() {
       {/* One quiet paragraph, not a failure box: nobody should scroll past a list
           of HTTP errors to reach the result. The failure detail sits with the
           section the failing endpoints actually feed. */}
-      <p className="mb-8 text-sm text-[var(--text-secondary)]">
-        Primary analysis covers {PRIMARY_WINDOW.label}. Collection was degraded{' '}
-        {DEGRADED_WINDOW.label} &mdash; see{' '}
-        <a href="#limitations" className="underline underline-offset-2">
-          limitations
-        </a>
-        .
-        {problems.length > 0 ? (
-          <>
-            {' '}
-            Some figures may currently be incomplete &mdash; see{' '}
-            <a href="#collection-status" className="underline underline-offset-2">
-              collection status
-            </a>
-            .
-          </>
-        ) : null}
-      </p>
+      <div className="mb-8 space-y-1">
+        <p className="text-sm text-[var(--text-secondary)]">
+          Primary analysis covers {PRIMARY_WINDOW.label}. Collection was degraded{' '}
+          {DEGRADED_WINDOW.label} &mdash; see{' '}
+          <a href="#limitations" className="underline underline-offset-2">
+            limitations
+          </a>
+          .
+          {problems.length > 0 ? (
+            <>
+              {' '}
+              Some figures may currently be incomplete &mdash; see{' '}
+              <a href="#collection-status" className="underline underline-offset-2">
+                collection status
+              </a>
+              .
+            </>
+          ) : null}
+        </p>
+        <DataAge fetchedAt={fetchedAt} rollupAt={summary.data?.rollup_computed_at ?? null} />
+      </div>
 
       {/* 1. THE FINDING, generated from data, above everything else. */}
       <section className="mb-14 border-y border-[var(--rule)] py-8">
@@ -152,8 +161,8 @@ export default async function Page() {
 
       <footer className="border-t border-[var(--rule)] pt-6 text-xs text-[var(--text-muted)]">
         <p>
-          Data from the MBTA V3 API. Rollups last recomputed{' '}
-          {ago(summary.data?.rollup_computed_at ?? null)}; this page revalidates every 30 minutes.
+          Data from the MBTA V3 API. Rollups recompute daily at 04:00 ET, and this page is rebuilt
+          once a day after that; the line at the top says when its data was actually fetched.
           Aggregates over a date range are n-weighted means of per-day medians, because medians do
           not compose &mdash; sample sizes are exact.
         </p>
