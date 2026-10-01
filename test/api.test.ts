@@ -85,7 +85,7 @@ describe('estimateGateOpen', () => {
   const week = ['2026-09-28', '2026-09-29', '2026-09-30', '2026-10-01', '2026-10-02', '2026-10-03', '2026-10-04'];
 
   it('declines to estimate until every weekday has a folded date', () => {
-    const r = estimateGateOpen([{ weekday: 1, n: 5 }], week.slice(0, 6), gate);
+    const r = estimateGateOpen([{ weekday: 1, n: 5 }], week.slice(0, 6), '2026-10-04', gate);
     expect(r.date).toBeNull();
     expect(r.basis).toMatch(/every weekday/);
   });
@@ -93,7 +93,7 @@ describe('estimateGateOpen', () => {
   it('extrapolates each cell at its own weekday rate', () => {
     // n = 5 per cell after one week each: 3 more weeks to reach 20.
     const cells = Array.from({ length: 7 }, (_, w) => ({ weekday: w, n: 5 }));
-    const r = estimateGateOpen(cells, week, gate);
+    const r = estimateGateOpen(cells, week, '2026-10-04', gate);
     expect(r.weeks).toBe(3);
     // Newest folded date + 3 weeks + the two-day fold lag.
     expect(r.date).toBe('2026-10-27');
@@ -105,12 +105,22 @@ describe('estimateGateOpen', () => {
       ...Array.from({ length: 6 }, () => ({ weekday: 1, n: 30 })),
       ...Array.from({ length: 4 }, () => ({ weekday: 1, n: 1 })),
     ];
-    const r = estimateGateOpen(cells, week, gate);
+    const r = estimateGateOpen(cells, week, '2026-10-04', gate);
     expect(r.weeks).toBeGreaterThan(0); // coverage met now; mean (18.4) is not
   });
 
   it('reports no date once the gate is already met', () => {
     const cells = Array.from({ length: 7 }, (_, w) => ({ weekday: w, n: 25 }));
-    expect(estimateGateOpen(cells, week, gate)).toMatchObject({ date: null, weeks: 0 });
+    expect(estimateGateOpen(cells, week, '2026-10-04', gate)).toMatchObject({ date: null, weeks: 0 });
+  });
+
+  it('counts forward from today, never from old backfill dates — no estimate in the past', () => {
+    // Only August is folded, as on 2026-10-01; one date per weekday, n = 5 per cell.
+    const aug = ['2026-08-02', '2026-08-03', '2026-08-04', '2026-08-05', '2026-08-06', '2026-08-07', '2026-08-08'];
+    const cells = Array.from({ length: 7 }, (_, w) => ({ weekday: w, n: 5 }));
+    const r = estimateGateOpen(cells, aug, '2026-10-01', gate);
+    // 3 weeks from the newest foldable date (Sept 29) plus the 2-day lag.
+    expect(r.date).toBe('2026-10-22');
+    expect(r.date! > '2026-10-01').toBe(true);
   });
 });

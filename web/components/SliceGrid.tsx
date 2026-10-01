@@ -1,4 +1,5 @@
-import { fmtInt, type SliceResponse } from '@/lib/api';
+import TypicalWeekHeatmap from '@/components/TypicalWeekHeatmap';
+import { fmtInt, type SliceInfo, type SliceResponse } from '@/lib/api';
 
 /**
  * The typical-week grid — stop x weekday x hour x bucket — deliberately NOT
@@ -13,7 +14,17 @@ import { fmtInt, type SliceResponse } from '@/lib/api';
  * would be inventing precision. The gate is data-driven and comes from the API, so
  * the section turns itself on once the data supports it, with no code change.
  */
-export default function SliceGrid({ data }: { data: SliceResponse | null }) {
+export default function SliceGrid({
+  data,
+  slices,
+  apiBase,
+}: {
+  data: SliceResponse | null;
+  /** Watched stop-directions, for the heatmap's selectors. */
+  slices: SliceInfo[];
+  /** Worker base including any /demo prefix, for the heatmap's refetches. */
+  apiBase: string;
+}) {
   if (!data) return null;
 
   // Density, not a raw count. A grid where 8% of cells clear the threshold is not
@@ -88,38 +99,12 @@ export default function SliceGrid({ data }: { data: SliceResponse | null }) {
   return (
     <div>
       <h2 className="text-lg font-semibold">Typical week</h2>
-      <p className="mb-4 mt-1 text-sm text-[var(--text-secondary)]">
-        Share of predictions within 60 seconds of the actual arrival, for cells with at least{' '}
-        {data.min_n} graded predictions.
+      <p className="mb-4 mt-1 max-w-2xl text-sm text-[var(--text-secondary)]">
+        How often predictions land within a minute of the actual arrival, by weekday and hour, for
+        one stop at a time. Accumulated across {fmtInt(data.accumulation?.dates_folded ?? 0)} service
+        dates; cells with fewer than {data.min_n} predictions are left empty.
       </p>
-      <div className="overflow-x-auto">
-        <table className="w-full border-collapse text-sm">
-          <thead>
-            <tr className="border-b border-[var(--rule)] text-left text-[var(--text-secondary)]">
-              <th scope="col" className="py-2 pr-4 font-medium">Stop</th>
-              <th scope="col" className="py-2 pr-4 font-medium">Weekday</th>
-              <th scope="col" className="py-2 pr-4 font-medium">Hour</th>
-              <th scope="col" className="py-2 pr-4 font-medium">Point</th>
-              <th scope="col" className="py-2 pr-4 text-right font-medium">Within 60s</th>
-              <th scope="col" className="py-2 pr-4 text-right font-medium">n</th>
-            </tr>
-          </thead>
-          <tbody>
-            {data.cells.slice(0, 60).map((c, i) => (
-              <tr key={i} className="border-b border-[var(--grid)]">
-                <td className="py-1.5 pr-4">{c.stop_id}</td>
-                <td className="py-1.5 pr-4">{c.weekday}</td>
-                <td className="py-1.5 pr-4 tabular-nums">{c.hour}:00</td>
-                <td className="py-1.5 pr-4">{c.horizon_bucket}</td>
-                <td className="py-1.5 pr-4 text-right tabular-nums">
-                  {`${Math.round(c.share_within_60s * 100)}%`}
-                </td>
-                <td className="py-1.5 pr-4 text-right tabular-nums">{fmtInt(c.n)}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
+      <TypicalWeekHeatmap slices={slices} apiBase={apiBase} minN={data.min_n} initial={data.slice ?? null} />
     </div>
   );
 }

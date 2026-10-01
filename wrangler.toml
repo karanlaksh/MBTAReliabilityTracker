@@ -14,6 +14,15 @@ database_name = "mbta"
 # Created by: wrangler d1 create mbta  (region ENAM)
 database_id = "dca8dab5-d1c1-4f94-a8b0-b6ebb42ee562"
 
+# DEMO ONLY. A separate, seeded database for the recorded demo; the live
+# collector, matcher and rollup never touch it — they use DB above. Read only by
+# the /demo/api/* routes. Undo: delete the database (wrangler d1 delete
+# mbta-demo), remove this block, and unset DEMO_MODE on the site. See README.
+[[d1_databases]]
+binding = "DB_DEMO"
+database_name = "mbta-demo"
+database_id = "707e31df-217d-434b-93c2-c64135399454"
+
 [observability]
 enabled = true
 
@@ -27,3 +36,15 @@ enabled = true
 [vars]
 # Not a secret: the account id appears in every Cloudflare dashboard URL.
 CF_ACCOUNT_ID = "d4766f1fd2394e896ab3b476137b7e84"
+# Trip assistant model (src/ask.ts). The key is the secret GEMINI_API_KEY.
+GEMINI_MODEL = "gemini-3.5-flash-lite"
+
+# Trip assistant rate limit: 10 questions per minute per client IP. Each question
+# reads D1 (budget shared with the live collector) and calls Gemini (free tier).
+[[ratelimits]]
+name = "ASK_LIMITER"
+namespace_id = "1001"
+
+  [ratelimits.simple]
+  limit = 10
+  period = 60

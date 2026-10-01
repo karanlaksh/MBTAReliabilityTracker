@@ -69,6 +69,88 @@ rollup, API, ad-hoc `wrangler` queries — and still answers while D1 is refusin
 ad-hoc `MAX()` over `prediction_snapshots` during the investigation read 962k rows on its
 own; a self-reported counter would never have seen it.
 
+## Demo mode (recorded demo only)
+
+A separate, **seeded** copy of the dashboard for a recorded demo. Nothing in it is collected
+data. It never touches the real database, and production never runs in demo mode.
+
+**What it is.**
+
+- **`mbta-demo`** — a second D1 database, same migrations, bound to the Worker as `DB_DEMO`.
+  Seeded by `scripts/seed-demo.mjs` with three months (2026-07-01 → 09-30) of synthetic
+  rollup rows: `rollup_error_by_day`, `rollup_grid_totals`, `rollup_grid_folded`,
+  `arrival_counts`, `watched_stops`, `collector_runs`. No raw snapshots or arrivals.
+  Anchored on the **measured** Aug 1–19 p10 / median / p90 for each route and evaluation
+  point, real August volumes and day-to-day spread; rush hours, weekends and stops vary
+  around those. One set of synthetic per-prediction draws produces every table, so they agree
+  with each other. Twelve stops, six of which the real collector does not watch (Symphony,
+  Prudential, Copley, Park St, Back Bay, Downtown Crossing). The `demo_seed` table records
+  the generator, seed and parameters; it is the in-database marker that this is synthetic.
+- **`/demo/api/*`** on the Worker — the same handlers as `/api/*`, given `DB_DEMO`.
+  `/demo/api/ask` is the trip assistant (below). There is no assistant on the real database.
+- **`DEMO_MODE=true`** on the site, set on a **Vercel preview deployment only** — never on
+  production. It reads `/demo/api/*` and hides the content about the real dataset's history:
+  the degraded-data note and data-age line, the degraded banner, the September break on the
+  day-by-day chart, and the limitations section. Those are gated in `web/lib/mode.ts`, not
+  removed. It also shows the trip assistant panel.
+
+**Undo, completely.**
+
+1. `npx wrangler d1 delete mbta-demo`
+2. Remove the `DB_DEMO` block from `wrangler.toml`, then `npx wrangler deploy`. (A Worker
+   bound to a deleted database will not deploy, so step 2 is not optional.)
+3. Unset `DEMO_MODE` on the Vercel preview, or delete that deployment.
+4. Optionally `npx wrangler secret delete GEMINI_API_KEY`.
+
+The real database, collector, matcher and rollup are untouched by all of this.
+
+**Seeding cost.** D1's 100,000 writes/day is account-wide and shared with the live collector
+(~55–60k/day), so the seed goes in two halves on two UTC days: part 1 (~22.8k writes) and
+part 2, `collector_runs` (~10k). Part 2 is generated relative to the time it is imported,
+because `/api/summary` counts the last 7 days of runs.
+
+**It ages.** `/api/summary`'s "last 7 days" counts are relative to the real date and the seed
+ends 2026-09-30, so after about 2026-10-07 every seeded stop reads as having no recent
+service. Re-seed (both parts) to record later.
+
+### Trip assistant: "so should I leave earlier?"
+
+`src/ask.ts`, served at `/demo/api/ask`, shown on the page only in demo mode.
+
+**The model never produces a reliability number.** It does two narrow jobs: parse the
+question into a fixed JSON schema (Gemini structured output), and optionally reword the
+answer. Its stop names are matched against a fixed alias list in code, never trusted. Its
+wording must use placeholders — `{share}`, `{platform_by}`, … — and `guardPhrasing()`
+rejects any wording containing a digit, a number word, an unknown placeholder or a missing
+required one; the fixed template is used instead. Enforcement, not instruction: tested with
+deliberately bad model output, including an end-to-end test in which a model that invents
+"8:05" and "62%" is overruled and only database figures reach the answer.
+
+**The answer shape follows the data model.** The share within 60 seconds is **by hour**,
+from `rollup_grid_totals`; the median and 90th percentile are **by day**, from
+`rollup_error_by_day`. Medians do not compose across dates, which is why the grid stores
+share-within-60s, which is why the answer is a share by hour and a median by day.
+
+**The platform-by time is arithmetic:**
+
+```
+platform_by = arrive_by − ride − headway − p90 lateness, rounded DOWN to 5 minutes
+```
+
+- **ride** — scheduled in-vehicle time, origin → destination, from MBTA's published schedules
+  (`src/schedule.ts`, generated from the V3 API with its fetch date recorded).
+- **headway** — scheduled gap between trains at that hour: room to miss one.
+- **p90 lateness** — 90th-percentile signed error of the destination's arrival prediction at the
+  evaluation point nearest the ride. Early-running counts as zero buffer, never as extra time.
+
+Example (seeded data): 9:00 − 13 min − 8 min − 6.3 min = 8:32 → **be on the platform at
+Northeastern by 8:30**. It says "platform by", not "leave by": the walk to the stop is unknown.
+It assumes the planned train's prediction starts out close to its schedule.
+
+**Refusals, stated plainly:** a stop not in the data, a question that is not a trip, a pair
+with no single route, a cell under n = 20, no scheduled service at that hour, no arrival time.
+Rate-limited to 10 questions per minute per client.
+
 ## What the collector does
 
 Once a minute:

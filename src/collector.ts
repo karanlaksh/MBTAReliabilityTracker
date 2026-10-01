@@ -29,6 +29,16 @@ export interface Env {
   /** Cloudflare account id and an Account Analytics: Read token, for read usage. */
   CF_ACCOUNT_ID?: string;
   CF_API_TOKEN?: string;
+  /**
+   * DEMO ONLY: the seeded mbta-demo database, read by /demo/api/* and nothing
+   * else. The collector, matcher and rollup use DB and never see this.
+   */
+  DB_DEMO?: D1Database;
+  /** Trip assistant (src/ask.ts): Gemini key, a secret; model id, a var. */
+  GEMINI_API_KEY?: string;
+  GEMINI_MODEL?: string;
+  /** Per-client limit on /api/ask: each question reads the database and calls Gemini. */
+  ASK_LIMITER?: { limit(opts: { key: string }): Promise<{ success: boolean }> };
 }
 
 export interface RunRecord {

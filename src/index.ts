@@ -1,5 +1,6 @@
 import { runTick, type Env } from './collector';
 import { runBackfill, runMatch } from './matcher';
+import { ask } from './ask';
 import { ROLLUP_FLOOR, runRollup, shouldRecompute } from './rollup';
 import { fetchAccountUsage, type AccountUsage } from './usage';
 import { errorByDay, errorByHorizon, errorBySlice, summary } from './api';
@@ -83,6 +84,53 @@ export default {
     // Read-only API for the frontend, served entirely from the rollup tables.
     // Never from prediction_snapshots: no secondary index, 518k rows now and ~3M
     // by November.
+    // DEMO ONLY — trip assistant (src/ask.ts). POST {question}, answered from the
+    // seeded mbta-demo database. There is deliberately no /api/ask on the real
+    // database: the panel only exists in DEMO_MODE, and an unused public endpoint
+    // would spend the real read budget. Rate-limited per client anyway: every
+    // question reads D1 — whose daily read budget is shared, account-wide, with
+    // the live collector — and spends Gemini free-tier quota.
+    if (url.pathname === '/demo/api/ask') {
+      const cors = {
+        'access-control-allow-origin': '*',
+        'access-control-allow-methods': 'POST, OPTIONS',
+        'access-control-allow-headers': 'content-type',
+      };
+      if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors });
+      if (request.method !== 'POST') return json({ error: 'POST only' }, 405);
+      const db = env.DB_DEMO;
+      if (!db) return json({ error: 'demo database not bound' }, 404);
+      const client = request.headers.get('cf-connecting-ip') ?? 'unknown';
+      if (env.ASK_LIMITER && !(await env.ASK_LIMITER.limit({ key: client })).success) {
+        return new Response(JSON.stringify({ status: 'rate_limited', answer: 'Too many questions — wait a minute and try again.' }), {
+          status: 429, headers: { 'content-type': 'application/json', ...cors },
+        });
+      }
+      let question = '';
+      try {
+        question = String(((await request.json()) as { question?: unknown }).question ?? '');
+      } catch {
+        return json({ error: 'body must be JSON {question}' }, 400);
+      }
+      const result = await ask(env, db, question, Math.floor(Date.now() / 1000));
+      return new Response(JSON.stringify(result), { headers: { 'content-type': 'application/json', 'cache-control': 'no-store', ...cors } });
+    }
+
+    // DEMO ONLY. /demo/api/* serves the same handlers from the seeded mbta-demo
+    // database: the handlers are unchanged, they are just handed DB_DEMO as DB.
+    // The real /api/* paths below are untouched. Undo: remove this block and the
+    // DB_DEMO binding (see README "Demo mode").
+    if (url.pathname.startsWith('/demo/api/')) {
+      if (!env.DB_DEMO) return json({ error: 'demo database not bound' }, 404);
+      const demoEnv: Env = { ...env, DB: env.DB_DEMO };
+      const path = url.pathname.slice('/demo'.length);
+      if (path === '/api/error-by-horizon') return errorByHorizon(demoEnv, url);
+      if (path === '/api/error-by-day') return errorByDay(demoEnv, url);
+      if (path === '/api/error-by-slice') return errorBySlice(demoEnv, url);
+      if (path === '/api/summary') return summary(demoEnv);
+      return json({ error: 'not found' }, 404);
+    }
+
     if (url.pathname === '/api/error-by-horizon') return errorByHorizon(env, url);
     if (url.pathname === '/api/error-by-day') return errorByDay(env, url);
     if (url.pathname === '/api/error-by-slice') return errorBySlice(env, url);

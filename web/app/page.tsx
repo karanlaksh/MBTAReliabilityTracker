@@ -5,10 +5,14 @@ import Finding from '@/components/Finding';
 import Limitations from '@/components/Limitations';
 import ModeComparison from '@/components/ModeComparison';
 import SliceGrid from '@/components/SliceGrid';
+import TripAssistant from '@/components/TripAssistant';
 import TimeSeries from '@/components/TimeSeries';
+import { API_PREFIX, BREAK_WINDOW, DEMO_MODE, HEADLINE_WINDOW } from '@/lib/mode';
 import {
+  DEFAULT_GRID_SLICE,
   DEGRADED_WINDOW,
   PRIMARY_WINDOW,
+  WORKER_BASE,
   getJson,
   type DayResponse,
   type HorizonResponse,
@@ -33,11 +37,15 @@ export default async function Page() {
     // not pooled across the September outage. The day-by-day series is not
     // windowed: it shows everything, with the outage as a labelled gap.
     getJson<HorizonResponse>(
-      `/api/error-by-horizon?from=${PRIMARY_WINDOW.from}&to=${PRIMARY_WINDOW.to}`,
+      `${API_PREFIX}/api/error-by-horizon?from=${HEADLINE_WINDOW.from}&to=${HEADLINE_WINDOW.to}`,
     ),
-    getJson<DayResponse>('/api/error-by-day'),
-    getJson<SummaryResponse>('/api/summary'),
-    getJson<SliceResponse>('/api/error-by-slice?min_n=20'),
+    getJson<DayResponse>(`${API_PREFIX}/api/error-by-day`),
+    getJson<SummaryResponse>(`${API_PREFIX}/api/summary`),
+    getJson<SliceResponse>(
+      `${API_PREFIX}/api/error-by-slice?min_n=20&stop=${DEFAULT_GRID_SLICE.stop}` +
+        `&route=${DEFAULT_GRID_SLICE.route}&dir=${DEFAULT_GRID_SLICE.dir}` +
+        `&bucket=${encodeURIComponent(DEFAULT_GRID_SLICE.bucket)}`,
+    ),
   ]);
 
   const problems = [horizon.error, days.error, summary.error, slices.error].filter(
@@ -72,38 +80,41 @@ export default async function Page() {
       {/* One quiet paragraph, not a failure box: nobody should scroll past a list
           of HTTP errors to reach the result. The failure detail sits with the
           section the failing endpoints actually feed. */}
-      <div className="mb-8 space-y-1">
-        <p className="text-sm text-[var(--text-secondary)]">
-          Primary analysis covers {PRIMARY_WINDOW.label}. Collection was degraded{' '}
-          {DEGRADED_WINDOW.label} &mdash; see{' '}
-          <a href="#limitations" className="underline underline-offset-2">
-            limitations
-          </a>
-          .
-          {problems.length > 0 ? (
-            <>
-              {' '}
-              Some figures may currently be incomplete &mdash; see{' '}
-              <a href="#collection-status" className="underline underline-offset-2">
-                collection status
-              </a>
-              .
-            </>
+      {/* Gated, not removed: hidden only in DEMO_MODE (lib/mode.ts). */}
+      {!DEMO_MODE ? (
+        <div className="mb-8 space-y-1">
+          <p className="text-sm text-[var(--text-secondary)]">
+            Primary analysis covers {PRIMARY_WINDOW.label}. Collection was degraded{' '}
+            {DEGRADED_WINDOW.label} &mdash; see{' '}
+            <a href="#limitations" className="underline underline-offset-2">
+              limitations
+            </a>
+            .
+            {problems.length > 0 ? (
+              <>
+                {' '}
+                Some figures may currently be incomplete &mdash; see{' '}
+                <a href="#collection-status" className="underline underline-offset-2">
+                  collection status
+                </a>
+                .
+              </>
           ) : null}
         </p>
         <DataAge fetchedAt={fetchedAt} rollupAt={summary.data?.rollup_computed_at ?? null} />
       </div>
+      ) : null}
 
       {/* 1. THE FINDING, generated from data, above everything else. */}
       <section className="mb-14 border-y border-[var(--rule)] py-8">
-        <Finding series={series} windowLabel={PRIMARY_WINDOW.label} />
+        <Finding series={series} windowLabel={HEADLINE_WINDOW.label} />
       </section>
 
       {/* 2. MODE COMPARISON. */}
       <section className="mb-14">
         <h2 className="text-lg font-semibold">Accuracy by how far ahead the prediction was made</h2>
         <p className="mb-5 mt-1 max-w-2xl text-sm text-[var(--text-secondary)]">
-          {PRIMARY_WINDOW.label}. Each point is graded at a fixed horizon &mdash; the prediction that
+          {HEADLINE_WINDOW.label}. Each point is graded at a fixed horizon &mdash; the prediction that
           was on the display when the vehicle was that far away. Positive means it arrived later than
           promised.
         </p>
@@ -118,7 +129,7 @@ export default async function Page() {
           late-night trip belongs to the previous day.
         </p>
         {days.data ? (
-          <TimeSeries rows={days.data.rows} />
+          <TimeSeries rows={days.data.rows} degraded={BREAK_WINDOW} />
         ) : (
           // A failed fetch is not a shortage of data, and must not read as one.
           <p className="text-sm text-[var(--text-secondary)]">
@@ -130,11 +141,28 @@ export default async function Page() {
       {/* Typical-week grid: query written, display gated on sample size. It turns
           itself on as months accumulate. */}
       <section className="mb-14">
-        <SliceGrid data={slices.data} />
+        <SliceGrid
+          data={slices.data}
+          slices={summary.data?.slices ?? []}
+          apiBase={`${WORKER_BASE}${API_PREFIX}`}
+        />
       </section>
 
+      {/* DEMO ONLY: the trip assistant. Absent unless DEMO_MODE (lib/mode.ts). */}
+      {DEMO_MODE ? (
+        <section className="mb-14">
+          <h2 className="text-lg font-semibold">So should I leave earlier?</h2>
+          <p className="mb-5 mt-1 max-w-2xl text-sm text-[var(--text-secondary)]">
+            Ask about a trip and a time you need to arrive. The answer uses the same figures as the
+            charts above &mdash; the share within a minute for that hour, and the day&rsquo;s median
+            and 90th-percentile miss &mdash; and ends in a time to be on the platform.
+          </p>
+          <TripAssistant apiBase={`${WORKER_BASE}${API_PREFIX}`} />
+        </section>
+      ) : null}
+
       {/* 4. COLLECTION STATUS, with the degraded banner directly above it. */}
-      <DegradedBanner messages={problems} />
+      {!DEMO_MODE ? <DegradedBanner messages={problems} /> : null}
       <section id="collection-status" className="mb-14 scroll-mt-8">
         <h2 className="text-lg font-semibold">Collection status</h2>
         <p className="mb-5 mt-1 max-w-2xl text-sm text-[var(--text-secondary)]">
@@ -150,14 +178,17 @@ export default async function Page() {
       </section>
 
       {/* Limitations: on the page, not in a footer. */}
-      <section id="limitations" className="mb-14 scroll-mt-8 rounded-lg bg-[var(--surface-2)] p-6">
-        <h2 className="text-lg font-semibold">What this does not show</h2>
-        <p className="mb-5 mt-1 max-w-2xl text-sm text-[var(--text-secondary)]">
-          Read these before quoting any number above. They are sourced from the project&rsquo;s own
-          README, not written separately for this page.
-        </p>
-        <Limitations />
-      </section>
+      {/* Gated, not removed: hidden only in DEMO_MODE (lib/mode.ts). */}
+      {!DEMO_MODE ? (
+        <section id="limitations" className="mb-14 scroll-mt-8 rounded-lg bg-[var(--surface-2)] p-6">
+          <h2 className="text-lg font-semibold">What this does not show</h2>
+          <p className="mb-5 mt-1 max-w-2xl text-sm text-[var(--text-secondary)]">
+            Read these before quoting any number above. They are sourced from the project&rsquo;s own
+            README, not written separately for this page.
+          </p>
+          <Limitations />
+        </section>
+      ) : null}
 
       <footer className="border-t border-[var(--rule)] pt-6 text-xs text-[var(--text-muted)]">
         <p>

@@ -14,6 +14,7 @@
 // is a route-grain pooled rollup, which is out of scope here.
 
 import type { Env } from './collector';
+import { serviceDate } from './service-date';
 
 /** Rollups recompute once daily at 04:00 local, so a 30-minute cache is generous. */
 const CACHE_CONTROL = 'public, max-age=1800, s-maxage=3600, stale-while-revalidate=86400';
@@ -346,7 +347,11 @@ interface GridCell {
  * n / (folded dates with that weekday). From that, each cell's time to reach
  * minN; the coverage gate opens when the minCoverage-th fraction of cells has
  * reached it, and the mean gate when mean n reaches minMeanN. The estimate is the
- * later of the two, counted from the newest folded date plus the two-day fold lag.
+ * later of the two, counted forward from WHEN NEW DATA STARTS ARRIVING: the later
+ * of the newest folded date and today's newest foldable date (today minus the
+ * two-day fold lag), plus that lag. Counting from the newest folded date alone
+ * was wrong: with only the August backfill folded it produced a date in early
+ * September — in the past — because history is not future accumulation.
  *
  * Deliberately simple and stated as such: it assumes future dates look like the
  * folded ones and that no new cells appear. Returns null until every weekday has
@@ -355,6 +360,7 @@ interface GridCell {
 export function estimateGateOpen(
   cells: GridCell[],
   foldedDates: string[],
+  today: string,
   gate: { minN: number; minCoverage: number; minMeanN: number } = GRID_GATE,
 ): { date: string | null; weeks: number | null; basis: string } {
   const perWeekday = new Array(7).fill(0);
@@ -371,8 +377,10 @@ export function estimateGateOpen(
   const meanRate = rates.reduce((t, r) => t + r, 0) / rates.length;
   const meanWeeks = meanN >= gate.minMeanN ? 0 : (gate.minMeanN - meanN) / meanRate;
   const weeks = Math.max(coverageWeeks, meanWeeks);
-  const newest = [...foldedDates].sort().at(-1)!;
-  const t = Date.parse(`${newest}T12:00:00Z`) + Math.ceil(weeks * 7 + 2) * 86_400_000;
+  const DAY = 86_400_000;
+  const newestFolded = Date.parse(`${[...foldedDates].sort().at(-1)!}T12:00:00Z`);
+  const newestFoldable = Date.parse(`${today}T12:00:00Z`) - 2 * DAY;
+  const t = Math.max(newestFolded, newestFoldable) + Math.ceil(weeks * 7 + 2) * DAY;
   return {
     date: weeks === 0 ? null : new Date(t).toISOString().slice(0, 10),
     weeks: Number(weeks.toFixed(1)),
@@ -414,6 +422,38 @@ export async function errorBySlice(env: Env, url: URL): Promise<Response> {
   const passing = cells.filter((c) => c.n >= minN);
   const meanN = cells.length ? cells.reduce((t, c) => t + c.n, 0) / cells.length : 0;
 
+  // One slice's full weekday x hour grid, for the heatmap: ?stop=&route=&dir=&bucket=.
+  // EVERY cell is returned, small ones included, so the page can draw a cell below
+  // min_n as empty rather than leaving the reader to wonder whether it is missing.
+  // At most 7 x 24 cells, from rows already read above.
+  const stop = url.searchParams.get('stop');
+  const route = url.searchParams.get('route');
+  const dir = url.searchParams.get('dir');
+  const bucket = url.searchParams.get('bucket');
+  const slice =
+    stop && route && dir !== null && bucket
+      ? {
+          stop_id: stop,
+          route_id: route,
+          direction_id: Number(dir),
+          horizon_bucket: bucket,
+          cells: cells
+            .filter(
+              (c) =>
+                c.stop_id === stop &&
+                c.route_id === route &&
+                c.direction_id === Number(dir) &&
+                c.horizon_bucket === bucket,
+            )
+            .map((c) => ({
+              weekday: c.weekday,
+              hour: c.hour,
+              n: c.n,
+              share_within_60s: Number((c.n_within_60 / c.n).toFixed(4)),
+            })),
+        }
+      : null;
+
   return jsonResponse({
     min_n: minN,
     metric: 'share_within_60s',
@@ -427,7 +467,8 @@ export async function errorBySlice(env: Env, url: URL): Promise<Response> {
       first: folded[0] ?? null,
       last: folded.at(-1) ?? null,
     },
-    estimate: estimateGateOpen(cells, folded),
+    estimate: estimateGateOpen(cells, folded, serviceDate(Math.floor(Date.now() / 1000))),
+    slice,
     note: 'accumulates across service dates as exact sums and counts; share within 60s is the displayed value',
     cells: passing
       .sort((x, y) => y.n - x.n)

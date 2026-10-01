@@ -17,7 +17,6 @@ function dateRange(from: string, to: string): string[] {
   return out;
 }
 
-const isDegraded = (d: string) => d >= DEGRADED_WINDOW.from && d <= DEGRADED_WINDOW.to;
 
 /**
  * Partial days are DROPPED from the plotted line, not drawn faintly.
@@ -38,7 +37,41 @@ const isDegraded = (d: string) => d >= DEGRADED_WINDOW.from && d <= DEGRADED_WIN
 
 /** Axis key for the collapsed degraded window. Not a date, so it can't collide. */
 const BREAK_KEY = 'break';
-export default function TimeSeries({ rows }: { rows: DayRow[] }) {
+
+/**
+ * Date labels on the first line; the break's label on a second line beneath its
+ * dashed rule. Two lines is what lets the dates either side of the break keep
+ * their own labels instead of being thinned away to make room for it.
+ */
+function BreakAwareTick({
+  x, y, payload, breakLabel,
+}: { x: number; y: number; payload: { value: string }; breakLabel: string }) {
+  const isBreak = payload.value === BREAK_KEY;
+  return (
+    <text
+      x={x}
+      y={y}
+      dy={isBreak ? 26 : 12}
+      textAnchor="middle"
+      fontSize={isBreak ? 10 : 11}
+      fill={isBreak ? 'var(--text-muted)' : 'var(--text-secondary)'}
+    >
+      {isBreak ? breakLabel : payload.value}
+    </text>
+  );
+}
+export default function TimeSeries({
+  rows,
+  degraded = DEGRADED_WINDOW,
+}: {
+  rows: DayRow[];
+  /**
+   * The window drawn as a collapsed break, and the caption that explains it.
+   * null in DEMO_MODE only: the seeded data has no outage to mark.
+   */
+  degraded?: { from: string; to: string; label: string } | null;
+}) {
+  const isDegraded = (d: string) => degraded !== null && d >= degraded.from && d <= degraded.to;
   const [bucket, setBucket] = useState<Bucket>('~9 min');
 
   const forBucket = rows.filter((r) => r.bucket === bucket);
@@ -53,26 +86,39 @@ export default function TimeSeries({ rows }: { rows: DayRow[] }) {
   // degraded window — the domain comes from the DATA; the window only extends it
   // while nothing newer exists — with the degraded dates replaced by one slot.
   const span = dates.length
-    ? dateRange(dates[0], dates[dates.length - 1] > DEGRADED_WINDOW.to ? dates[dates.length - 1] : DEGRADED_WINDOW.to)
+    ? dateRange(
+        dates[0],
+        degraded === null || dates[dates.length - 1] > degraded.to ? dates[dates.length - 1] : degraded.to,
+      )
     : [];
   const axis: string[] = [];
   for (const d of span) {
     if (!isDegraded(d)) axis.push(d);
     else if (axis[axis.length - 1] !== BREAK_KEY) axis.push(BREAK_KEY);
   }
-  const breakLabel = DEGRADED_WINDOW.label;
-  // Every fourth date plus the break and the last date, so the break's tick is
-  // always drawn rather than thinned away by the axis. Date ticks within two
-  // slots of the break are dropped: adjacent labels overprint each other, and the
-  // break's label is the one that must stay legible. Hovering still names a date.
+  const breakLabel = degraded?.label ?? '';
+  // Which dates get a tick label. The break's label is drawn on a SECOND LINE
+  // (see BreakAwareTick), so it can never collide with a date; dates only have to
+  // avoid each other. Dates are kept greedily by priority — the first date after
+  // the break and the last date always, then every fourth — and a date is skipped
+  // only if an already-kept date sits in an adjacent slot, where the two labels
+  // would overprint. The previous rule dropped every date within two slots of the
+  // break, which with one or two post-break dates left them all unlabelled.
   const breakAt = axis.indexOf(BREAK_KEY);
+  const priority: number[] = [];
+  if (breakAt >= 0 && breakAt + 1 < axis.length) priority.push(breakAt + 1);
+  priority.push(axis.length - 1);
+  for (let i = 0; i < axis.length; i += 4) priority.push(i);
+  const keptDates: number[] = [];
+  for (const i of priority) {
+    if (i < 0 || axis[i] === BREAK_KEY || keptDates.includes(i)) continue;
+    if (keptDates.some((k) => Math.abs(k - i) < 2)) continue;
+    keptDates.push(i);
+  }
   const ticks = axis
-    .map((d) => (d === BREAK_KEY ? d : d.slice(5)))
-    .filter((d, i, all) => {
-      if (d === BREAK_KEY) return true;
-      if (breakAt >= 0 && Math.abs(i - breakAt) < 2) return false;
-      return i % 4 === 0 || i === all.length - 1;
-    });
+    .map((d, i) => ({ d, i }))
+    .filter(({ d, i }) => d === BREAK_KEY || keptDates.includes(i))
+    .map(({ d }) => (d === BREAK_KEY ? d : d.slice(5)));
 
   const data = axis.map((d) => {
     const row: Record<string, string | number | null> = {
@@ -120,12 +166,12 @@ export default function TimeSeries({ rows }: { rows: DayRow[] }) {
             <CartesianGrid stroke="var(--grid)" vertical={false} />
             <XAxis
               dataKey="service_date"
-              tick={{ fontSize: 11, fill: 'var(--text-secondary)' }}
               stroke="var(--rule)"
               tickLine={false}
               ticks={ticks}
               interval={0}
-              tickFormatter={(v) => (v === BREAK_KEY ? breakLabel : v)}
+              height={40}
+              tick={(props: any) => <BreakAwareTick {...props} breakLabel={breakLabel} />}
             />
             {axis.includes(BREAK_KEY) ? (
               <ReferenceLine x={BREAK_KEY} stroke="var(--text-muted)" strokeDasharray="3 3" />
@@ -181,18 +227,24 @@ export default function TimeSeries({ rows }: { rows: DayRow[] }) {
 
       <p className="mt-2 text-xs text-[var(--text-muted)]">
         Median signed error per service date at the {bucket} evaluation point. Gaps are dates with
-        fewer than 20 graded arrivals for that route. The dashed break marks {breakLabel}, compressed
-        to a single step: the read-limit outage, when collection ran only from 20:00 ET until the
-        database&rsquo;s daily read budget ran out
-        {degradedWithData.length > 0 ? (
+        fewer than 20 graded arrivals for that route.
+        {degraded !== null ? (
           <>
             {' '}
-            &mdash; the {degradedWithData.length} partial date{degradedWithData.length === 1 ? '' : 's'}{' '}
-            recorded in it are not plotted
+            The dashed break marks {breakLabel}, compressed to a single step: the read-limit outage,
+            when collection ran only from 20:00 ET until the database&rsquo;s daily read budget ran out
+            {degradedWithData.length > 0 ? (
+              <>
+                {' '}
+                &mdash; the {degradedWithData.length} partial date
+                {degradedWithData.length === 1 ? '' : 's'} recorded in it are not plotted
+              </>
+            ) : null}
+            ; see limitations. Aug 18 and Aug 20&ndash;30 left an unusually high share of arrivals
+            unmatched (30&ndash;43%, against 1&ndash;5% on other days), for a reason not yet
+            determined.
           </>
         ) : null}
-        ; see limitations. Aug 18 and Aug 20&ndash;30 left an unusually high share of arrivals
-        unmatched (30&ndash;43%, against 1&ndash;5% on other days), for a reason not yet determined.
         {partial.length > 0 && (
           <>
             {' '}

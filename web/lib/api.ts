@@ -131,6 +131,18 @@ export interface SummaryResponse {
   service_alerts: ServiceAlert[];
 }
 
+/** Every weekday x hour cell for one slice, small cells included. */
+export interface SliceCells {
+  stop_id: string;
+  route_id: string;
+  direction_id: number;
+  horizon_bucket: string;
+  cells: { weekday: number; hour: number; n: number; share_within_60s: number }[];
+}
+
+/** The heatmap's first view: present in both the real and the seeded data. */
+export const DEFAULT_GRID_SLICE = { stop: 'place-nuniv', route: 'Green-E', dir: 1, bucket: '~9 min' } as const;
+
 export interface SliceResponse {
   min_n: number;
   /** The displayed value. Share of predictions within 60s: exact and outlier-resistant. */
@@ -151,6 +163,8 @@ export interface SliceResponse {
    * ever served by a Worker that predates migration 0011.
    */
   window_days?: number;
+  /** One stop/direction/bucket's full weekday x hour grid, when asked for. */
+  slice?: SliceCells | null;
   note: string;
   cells: {
     stop_id: string; route_id: string; direction_id: number; weekday: number;
