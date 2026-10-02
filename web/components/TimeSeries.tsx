@@ -104,15 +104,22 @@ export default function TimeSeries({
   // only if an already-kept date sits in an adjacent slot, where the two labels
   // would overprint. The previous rule dropped every date within two slots of the
   // break, which with one or two post-break dates left them all unlabelled.
+  //
+  // Spacing scales with the number of dates: a "MM-DD" label needs ~40px and the
+  // plot is ~880px wide, so two kept labels must be at least len/22 slots apart.
+  // Fixed spacing (every 4th, 2 slots apart) fit ~40 dates but overprinted at 92
+  // ("09-27" ran into "09-30").
+  const minGap = Math.max(2, Math.ceil(axis.length / 22));
+  const step = Math.max(4, minGap + 1);
   const breakAt = axis.indexOf(BREAK_KEY);
   const priority: number[] = [];
   if (breakAt >= 0 && breakAt + 1 < axis.length) priority.push(breakAt + 1);
   priority.push(axis.length - 1);
-  for (let i = 0; i < axis.length; i += 4) priority.push(i);
+  for (let i = 0; i < axis.length; i += step) priority.push(i);
   const keptDates: number[] = [];
   for (const i of priority) {
     if (i < 0 || axis[i] === BREAK_KEY || keptDates.includes(i)) continue;
-    if (keptDates.some((k) => Math.abs(k - i) < 2)) continue;
+    if (keptDates.some((k) => Math.abs(k - i) < minGap)) continue;
     keptDates.push(i);
   }
   const ticks = axis
@@ -187,7 +194,9 @@ export default function TimeSeries({
               y={0}
               stroke="var(--zero-line)"
               strokeWidth={1.5}
-              label={{ value: 'on time', position: 'insideTopLeft', fontSize: 11, fill: 'var(--text-muted)' }}
+              // Right end: at the left it overprinted the first date tick.
+              // Lifted clear of the line, which is the x-axis when the axis starts at 0.
+              label={{ value: 'on time', position: 'insideTopRight', offset: -8, fontSize: 11, fill: 'var(--text-muted)' }}
             />
             <Tooltip
               content={({ active, payload, label }: any) => {

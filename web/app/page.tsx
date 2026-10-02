@@ -193,7 +193,9 @@ export default async function Page() {
       <footer className="border-t border-[var(--rule)] pt-6 text-xs text-[var(--text-muted)]">
         <p>
           Data from the MBTA V3 API. Rollups recompute daily at 04:00 ET, and this page is rebuilt
-          once a day after that; the line at the top says when its data was actually fetched.
+          once a day after that
+          {/* The data-age line this refers to is hidden in DEMO_MODE (lib/mode.ts). */}
+          {DEMO_MODE ? '.' : <>; the line at the top says when its data was actually fetched.</>}{' '}
           Aggregates over a date range are n-weighted means of per-day medians, because medians do
           not compose &mdash; sample sizes are exact.
         </p>

@@ -23,10 +23,14 @@ type Result =
     }
   | { status: string; answer: string };
 
+/** Short label on the pill; the full question is what is sent. Nothing is truncated. */
 const EXAMPLES = [
-  'I have a 9am interview at Park Street. Leaving from Northeastern on a weekday — when should I be on the platform?',
-  'Ruggles to Downtown Crossing, arriving by 5:30pm on Friday',
-  'Kenmore to Park Street by 9am',
+  {
+    label: '9am interview at Park Street, from Northeastern',
+    question: 'I have a 9am interview at Park Street. Leaving from Northeastern on a weekday — when should I be on the platform?',
+  },
+  { label: 'Ruggles → Downtown Crossing by 5:30pm Friday', question: 'Ruggles to Downtown Crossing, arriving by 5:30pm on Friday' },
+  { label: 'Kenmore → Park Street by 9am', question: 'Kenmore to Park Street by 9am' },
 ];
 
 export default function TripAssistant({ apiBase }: { apiBase: string }) {
@@ -88,15 +92,16 @@ export default function TripAssistant({ apiBase }: { apiBase: string }) {
         <span className="text-xs text-[var(--text-secondary)]">Try:</span>
         {EXAMPLES.map((ex) => (
           <button
-            key={ex}
+            key={ex.label}
             type="button"
+            title={ex.question}
             onClick={() => {
-              setQuestion(ex);
-              void submit(ex);
+              setQuestion(ex.question);
+              void submit(ex.question);
             }}
             className="rounded-full border border-[var(--rule)] px-3 py-1 text-left text-xs text-[var(--text-secondary)] transition hover:border-[var(--text-muted)]"
           >
-            {ex.length > 60 ? `${ex.slice(0, 57)}…` : ex}
+            {ex.label}
           </button>
         ))}
       </div>

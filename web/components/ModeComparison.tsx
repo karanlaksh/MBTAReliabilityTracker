@@ -94,7 +94,12 @@ function Panel({
               strokeWidth={1.5}
               label={{
                 value: 'on time',
-                position: 'insideTopLeft',
+                // Right end: at the left it overprinted the first x tick and, in the
+                // median chart, the Green Line's -9s point at ~1.5 min.
+                position: 'insideTopRight',
+                // Lifted clear of the line: where the axis starts at 0 (the p90
+                // chart) the zero line IS the x-axis, and the label touched "~16 min".
+                offset: -8,
                 fontSize: 11,
                 fill: 'var(--text-muted)',
               }}
