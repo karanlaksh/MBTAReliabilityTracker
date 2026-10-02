@@ -422,6 +422,19 @@ export async function errorBySlice(env: Env, url: URL): Promise<Response> {
   const passing = cells.filter((c) => c.n >= minN);
   const meanN = cells.length ? cells.reduce((t, c) => t + c.n, 0) / cells.length : 0;
 
+  // The heatmap's colour scale, FITTED PER EVALUATION POINT: the 5th-95th
+  // percentile of share-within-60s across every stop's cells at that point.
+  // One scale per point, shared by all stops, so clicking between stops compares
+  // like with like; a scale per stop would make that comparison meaningless.
+  // Per point rather than global because the points differ too much for one
+  // absolute scale (median cell ~96% at ~1.5 min, ~36% at ~16 min in the demo).
+  const scale: Record<string, { lo: number; hi: number; cells: number }> = {};
+  for (const b of new Set(passing.map((c) => c.horizon_bucket))) {
+    const v = passing.filter((c) => c.horizon_bucket === b).map((c) => c.n_within_60 / c.n).sort((x, y) => x - y);
+    const q = (p: number) => v[Math.min(v.length - 1, Math.max(0, Math.round(p * (v.length - 1))))];
+    scale[b] = { lo: Number(q(0.05).toFixed(4)), hi: Number(q(0.95).toFixed(4)), cells: v.length };
+  }
+
   // One slice's full weekday x hour grid, for the heatmap: ?stop=&route=&dir=&bucket=.
   // EVERY cell is returned, small ones included, so the page can draw a cell below
   // min_n as empty rather than leaving the reader to wonder whether it is missing.
@@ -468,6 +481,7 @@ export async function errorBySlice(env: Env, url: URL): Promise<Response> {
       last: folded.at(-1) ?? null,
     },
     estimate: estimateGateOpen(cells, folded, serviceDate(Math.floor(Date.now() / 1000))),
+    scale,
     slice,
     note: 'accumulates across service dates as exact sums and counts; share within 60s is the displayed value',
     cells: passing

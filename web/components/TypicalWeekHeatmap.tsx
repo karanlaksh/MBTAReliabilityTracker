@@ -13,22 +13,32 @@ import { BUCKETS, fmtInt, type Bucket, type SliceCells, type SliceInfo } from '@
  * which end is good.
  *
  * One hue, light -> dark (sequential): darker = more predictions within a minute.
- * Five fixed 20-point bands, the same for every stop, so two stops can be compared
- * by eye. Steps from the reference sequential ramp starting at step 250, validated
- * with the dataviz palette checker on this surface (#fcfcfb, ordinal): monotone
- * lightness, adjacent gaps >= 0.06, light end 2.06:1, single hue — all pass.
+ *
+ * CONTINUOUS, AND FITTED PER EVALUATION POINT. The ramp spans the 5th-95th
+ * percentile of share-within-60s across EVERY stop's cells at the selected
+ * point (from the API), and is clamped beyond. Fixed 20-point bands put 60% of
+ * the default view's cells in one band and erased a rush-vs-midday gap of
+ * 0.17 that is four times the cell-to-cell noise. Per point, not per stop: all
+ * stops share a scale at a given point, so clicking between stops compares like
+ * with like. The legend shows the fitted numbers and says the ramp is fitted.
+ *
+ * Ramp: the reference sequential blue, steps 250 -> 700. Step 250 is the light
+ * end that passed the palette checker on this surface (#fcfcfb, 2.06:1).
  *
  * Cells below MIN_N are drawn EMPTY, not coloured: no figure without its sample
  * size, as everywhere else on this page. n is in every tooltip.
  */
-const BANDS = [
-  { min: 0.8, color: '#0d366b', label: '80–100%' },
-  { min: 0.6, color: '#1c5cab', label: '60–80%' },
-  { min: 0.4, color: '#2a78d6', label: '40–60%' },
-  { min: 0.2, color: '#5598e7', label: '20–40%' },
-  { min: 0, color: '#86b6ef', label: '0–20%' },
-];
-const colorFor = (share: number) => BANDS.find((b) => share >= b.min)!.color;
+const RAMP = ['#86b6ef', '#6da7ec', '#5598e7', '#3987e5', '#2a78d6', '#256abf', '#1c5cab', '#184f95', '#104281', '#0d366b'];
+const hex = (h: string) => [1, 3, 5].map((i) => parseInt(h.slice(i, i + 2), 16));
+/** Position 0..1 along the ramp, interpolated between adjacent steps. */
+function rampColor(t: number): string {
+  const x = Math.max(0, Math.min(1, t)) * (RAMP.length - 1);
+  const i = Math.min(RAMP.length - 2, Math.floor(x));
+  const [a, b] = [hex(RAMP[i]), hex(RAMP[i + 1])];
+  const f = x - i;
+  return `rgb(${a.map((v, k) => Math.round(v + (b[k] - v) * f)).join(',')})`;
+}
+const pct = (x: number) => `${Math.round(x * 100)}%`;
 
 const WEEKDAYS: { w: number; label: string }[] = [
   { w: 1, label: 'Mon' }, { w: 2, label: 'Tue' }, { w: 3, label: 'Wed' }, { w: 4, label: 'Thu' },
@@ -64,6 +74,7 @@ export default function TypicalWeekHeatmap({
   apiBase,
   minN,
   initial,
+  scale,
 }: {
   /** Watched stop-directions, from /api/summary. */
   slices: SliceInfo[];
@@ -72,6 +83,8 @@ export default function TypicalWeekHeatmap({
   minN: number;
   /** The default slice, fetched on the server so the first paint has data. */
   initial: SliceCells | null;
+  /** Colour scale per evaluation point (5th-95th percentile across all stops). */
+  scale: Record<string, { lo: number; hi: number; cells: number }>;
 }) {
   const stopName = (s: SliceInfo) => s.label.split(' — ')[0];
   const dirName = (s: SliceInfo) => (s.label.split(' — ')[1] ?? '').replace(/\s*\(terminus\)/, '');
@@ -123,6 +136,8 @@ export default function TypicalWeekHeatmap({
   const current = dirs.find((s) => s.direction_id === sel.dir) ?? dirs[0];
 
   const cell = (w: number, h: number) => data?.cells.find((c) => c.weekday === w && c.hour === h);
+  const fit = scale[sel.bucket] ?? { lo: 0, hi: 1, cells: 0 };
+  const colorFor = (share: number) => rampColor((share - fit.lo) / Math.max(0.01, fit.hi - fit.lo));
   const hovered = hover ? cell(hover.w, hover.h) : undefined;
 
   const pick = (patch: Partial<typeof sel>) =>
@@ -231,27 +246,32 @@ export default function TypicalWeekHeatmap({
             : ' '}
       </p>
 
-      {/* Legend: the direction is stated in words at both ends, not left to colour. */}
-      <div className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-2 text-xs text-[var(--text-secondary)]">
+      {/* Legend: real numbers at both ends, the direction in words, and the fit stated.
+          14px with bold end values, larger than the page's 12px captions: it must stay
+          legible when a screen recording is scaled down to half size (checked). */}
+      <div className="mt-4 flex flex-wrap items-center gap-x-4 gap-y-2 text-sm text-[var(--text-secondary)]">
         <span className="font-medium text-[var(--text-primary)]">Share of predictions within 60 seconds</span>
-        <span>Worse</span>
-        <span className="flex gap-[2px]" aria-hidden>
-          {[...BANDS].reverse().map((b) => (
-            <span key={b.color} className="flex flex-col items-center">
-              <span className="block h-3 w-9 rounded-[2px]" style={{ background: b.color }} />
-              <span className="mt-0.5 text-[10px] text-[var(--text-muted)] tabular-nums">{b.label}</span>
-            </span>
-          ))}
+        <span className="flex items-center gap-2.5">
+          <span className="font-semibold text-[var(--text-primary)]">Worse</span>
+          <span className="font-semibold tabular-nums text-[var(--text-primary)]">≤{pct(fit.lo)}</span>
+          <span
+            aria-hidden
+            className="block h-4 w-56 rounded-[3px]"
+            style={{ background: `linear-gradient(to right, ${RAMP.join(', ')})` }}
+          />
+          <span className="font-semibold tabular-nums text-[var(--text-primary)]">≥{pct(fit.hi)}</span>
+          <span className="font-semibold text-[var(--text-primary)]">Better</span>
         </span>
-        <span>Better</span>
-        <span className="flex items-center gap-1.5">
+        <span className="flex items-center gap-1.5 text-xs">
           <span className="block h-3 w-4 rounded-[2px] border border-dashed border-[var(--rule)]" aria-hidden />
           fewer than {minN} predictions
         </span>
       </div>
-      <p className="mt-2 text-xs text-[var(--text-muted)]">
+      <p className="mt-2 max-w-2xl text-xs text-[var(--text-muted)]">
         Higher is better here: unlike the error figures above, this is the share of predictions that
-        landed within a minute of the actual arrival.
+        landed within a minute of the actual arrival. The colour ramp is fitted to the {sel.bucket}{' '}
+        evaluation point &mdash; it spans the middle 90% of every stop&rsquo;s cells at that point, so
+        stops can be compared by colour. Changing the evaluation point refits it.
       </p>
     </div>
   );

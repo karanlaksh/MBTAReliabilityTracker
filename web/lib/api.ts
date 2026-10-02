@@ -165,6 +165,11 @@ export interface SliceResponse {
   window_days?: number;
   /** One stop/direction/bucket's full weekday x hour grid, when asked for. */
   slice?: SliceCells | null;
+  /**
+   * Heatmap colour scale per evaluation point: the 5th-95th percentile of
+   * share-within-60s across all stops' cells (n >= min_n) at that point.
+   */
+  scale?: Record<string, { lo: number; hi: number; cells: number }>;
   note: string;
   cells: {
     stop_id: string; route_id: string; direction_id: number; weekday: number;

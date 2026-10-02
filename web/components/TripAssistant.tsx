@@ -6,10 +6,10 @@ import { useState } from 'react';
  * DEMO ONLY — "so should I leave earlier?", answered from the rollup tables.
  *
  * The Worker (src/ask.ts) does all of it: a model parses the question into a
- * fixed schema, code looks the figures up and computes the platform-by time,
- * and any model phrasing that contains a number is rejected for a fixed
- * template. This panel only sends the question and shows what comes back —
- * including the arithmetic, so the decision can be checked rather than trusted.
+ * fixed schema, code looks the figures up and computes the platform-by time, and
+ * the answer is a fixed template. This panel only sends the question and shows
+ * what comes back — including the arithmetic, so the decision can be checked
+ * rather than trusted.
  */
 type Result =
   | {
@@ -121,9 +121,9 @@ export default function TripAssistant({ apiBase }: { apiBase: string }) {
                     <br />= {result.derivation.unrounded}, rounded down to {result.derivation.platform_by}
                   </p>
                   <p className="mt-2 text-xs text-[var(--text-muted)]">
-                    Every figure comes from the database and the arithmetic above; the language model only
-                    reads the question and words the answer, and any wording containing a number is
-                    discarded for a fixed template.
+                    Every figure comes from the database and the arithmetic above. The language model only
+                    reads the question; the answer is a fixed template, because a model rewording it can
+                    misstate what a correct number means.
                   </p>
                 </details>
               ) : null}

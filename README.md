@@ -117,14 +117,22 @@ service. Re-seed (both parts) to record later.
 
 `src/ask.ts`, served at `/demo/api/ask`, shown on the page only in demo mode.
 
-**The model never produces a reliability number.** It does two narrow jobs: parse the
-question into a fixed JSON schema (Gemini structured output), and optionally reword the
-answer. Its stop names are matched against a fixed alias list in code, never trusted. Its
-wording must use placeholders — `{share}`, `{platform_by}`, … — and `guardPhrasing()`
-rejects any wording containing a digit, a number word, an unknown placeholder or a missing
-required one; the fixed template is used instead. Enforcement, not instruction: tested with
-deliberately bad model output, including an end-to-end test in which a model that invents
-"8:05" and "62%" is overruled and only database figures reach the answer.
+**The model never produces a reliability number, and does not write the answer.** Its one
+job is to parse the question into a fixed JSON schema (Gemini structured output); its stop
+names are matched against a fixed alias list in code, never trusted. The answer is a fixed
+template filled with database figures and the computed platform-by time.
+
+**Why not let the model phrase it — the limitation is the interesting part.** It used to
+reword the template using placeholders (`{share}`, `{platform_by}`, …), and `guardPhrasing()`
+rejected any wording containing a digit, a number word, an unknown placeholder or a missing
+required one. That guard caught every fabricated *figure* it was tested against. On real
+seeded data it then passed *"Most 18% of your Green Line E trips arrive right on time"* —
+from a share of 18% of **predictions** landing within a minute. No stray digit, no number
+word, every placeholder valid, and false twice: 18% is not most, and the figure measures
+prediction accuracy, not punctuality. That is a fabricated **claim**, and a check on
+characters cannot see claims. It is a limit of the guard, not a prompt to tune; the fixed
+template is the only version whose answer provably matches the data. The guard and its
+tests are kept, including one asserting that it accepts that sentence.
 
 **The answer shape follows the data model.** The share within 60 seconds is **by hour**,
 from `rollup_grid_totals`; the median and 90th percentile are **by day**, from

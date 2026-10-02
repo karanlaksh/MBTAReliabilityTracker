@@ -40,6 +40,17 @@ describe('guardPhrasing — the model may not put a number on the screen', () =>
     });
   }
 
+  it('CANNOT see a fabricated claim — why the model no longer phrases answers', () => {
+    // Verbatim from a live run on seeded data, from a share of 18% of PREDICTIONS
+    // within a minute. No digit outside a placeholder, no number word, every
+    // placeholder valid: the guard passes it, and it is false twice ("most" of 18%;
+    // punctuality, not prediction accuracy). A character check cannot see claims.
+    const fabricatedClaim =
+      'Most {share} of your {route} trips arrive right on time, and the usual delay is just {median}. ' +
+      'To make your {arrive_by} arrival, head to the platform at {origin} by {platform_by} to stay safe.';
+    expect(guardPhrasing(fabricatedClaim)).toEqual({ ok: true });
+  });
+
   it('rejects non-string output', () => {
     expect(guardPhrasing(undefined).ok).toBe(false);
     expect(guardPhrasing({ text: good }).ok).toBe(false);
@@ -138,28 +149,19 @@ const NOW = Math.floor(Date.parse('2026-09-30T12:00:00Z') / 1000);
 describe('ask — end to end', () => {
   afterEach(() => vi.unstubAllGlobals());
 
-  it('a model that invents numbers is overruled: the template is used and only database figures appear', async () => {
-    fakeGemini('Leave at 8:05 — about 62% of trains are on time, so give yourself ten extra minutes.');
+  it('asks the model only to parse: one call, and the answer is the template filled from the database', async () => {
+    const calls = fakeGemini('Leave at 8:05 — about 62% of trains are on time.');
     const r = await ask(env, fakeDb(), 'Northeastern to Park St by 9am on a weekday?', NOW);
+    expect(calls).toEqual(['parse']); // no phrasing call at all
     expect(r.status).toBe('ok');
     if (r.status !== 'ok') return;
     expect(r.phrasing).toBe('template');
-    expect(r.guard_reason).toMatch(/digit/);
-    // None of the model's invented figures survive.
-    expect(r.answer).not.toMatch(/8:05|62%|ten extra/);
-    // The real ones do: 34% from the grid (170/500), the computed platform-by time.
-    expect(r.answer).toContain('34%');
-    expect(r.answer).toContain('8:30am');
+    expect(r.answer).not.toMatch(/8:05|62%/);
+    // The real figures: 34% from the grid (170/500), the computed platform-by time.
+    expect(r.answer).toContain('34% of predictions at Park Street land within a minute');
+    expect(r.answer).toContain('be on the platform at Northeastern by 8:30am');
     expect(r.answer).not.toMatch(/[{}]/); // every placeholder filled
     expect(r.derivation).toMatchObject({ ride_sec: 780, p90_sec: 356, platform_by: '8:30am', evaluation_point: '~16 min' });
-  });
-
-  it('a well-behaved model is used, with its placeholders filled from the database', async () => {
-    const calls = fakeGemini('{share} of predictions at {destination} land within a minute. Be at {origin} by {platform_by} for a {arrive_by} arrival.');
-    const r = await ask(env, fakeDb(), 'Northeastern to Park St by 9am on a weekday?', NOW);
-    expect(calls).toEqual(['parse', 'phrase']);
-    expect(r.status === 'ok' && r.phrasing).toBe('model');
-    expect(r.answer).toBe('34% of predictions at Park Street land within a minute. Be at Northeastern by 8:30am for a 9:00am arrival.');
   });
 
   it('says so plainly for a stop not in the data', async () => {
@@ -205,13 +207,13 @@ describe('ask — end to end', () => {
       const isParse = n === 2;
       const text = isParse
         ? JSON.stringify({ status: 'ok', origin: 'Northeastern', destination: 'Park Street', route: '', day: 'weekday', arrive_by: '09:00' })
-        : '{share} {origin} {arrive_by} {platform_by}';
+        : 'unused';
       return new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text }] } }] }));
     });
     const r = await ask(env, fakeDb(), 'Northeastern to Park St by 9am on a weekday?', NOW);
     vi.useRealTimers();
     expect(r.status).toBe('ok');
-    expect(n).toBe(3); // 503, retried parse, phrase
+    expect(n).toBe(2); // 503, then the retried parse; no phrasing call
   });
 
   it('does not retry a real error', async () => {
@@ -225,15 +227,5 @@ describe('ask — end to end', () => {
     expect(n).toBe(1);
   });
 
-  it('falls back to the template, not to failure, when phrasing is unavailable', async () => {
-    let n = 0;
-    vi.stubGlobal('fetch', async () => {
-      n++;
-      if (n === 2) return new Response('quota', { status: 429 });
-      return new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: JSON.stringify({ status: 'ok', origin: 'Northeastern', destination: 'Park Street', route: '', day: 'weekday', arrive_by: '09:00' }) }] } }] }));
-    });
-    const r = await ask(env, fakeDb(), 'Northeastern to Park St by 9am on a weekday?', NOW);
-    expect(r.status === 'ok' && r.phrasing).toBe('template');
-    expect(r.answer).toContain('8:30am');
-  });
+
 });

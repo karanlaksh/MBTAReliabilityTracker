@@ -104,7 +104,13 @@ export default function SliceGrid({
         one stop at a time. Accumulated across {fmtInt(data.accumulation?.dates_folded ?? 0)} service
         dates; cells with fewer than {data.min_n} predictions are left empty.
       </p>
-      <TypicalWeekHeatmap slices={slices} apiBase={apiBase} minN={data.min_n} initial={data.slice ?? null} />
+      <TypicalWeekHeatmap
+        slices={slices}
+        apiBase={apiBase}
+        minN={data.min_n}
+        initial={data.slice ?? null}
+        scale={data.scale ?? {}}
+      />
     </div>
   );
 }

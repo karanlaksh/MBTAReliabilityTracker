@@ -1,15 +1,26 @@
 // The trip assistant: "should I leave earlier?" — answered from the rollup tables.
 //
-// THE MODEL NEVER PRODUCES A RELIABILITY NUMBER. It does two narrow jobs:
-//   1. PARSE the question into a fixed JSON schema (stops, day, time). Its stop
-//      names are not trusted: they are matched against STOPS in code.
-//   2. PHRASE an answer, writing PLACEHOLDERS ({share}, {platform_by}, ...) rather
-//      than numbers. Code fills them in. guardPhrasing() then rejects any phrasing
-//      containing a digit, a number word, or an unknown placeholder, and the fixed
-//      template is used instead. Enforcement, not instruction: a model that ignores
-//      the prompt still cannot put a number on the screen.
-// Every figure comes from the database; the platform-by time is arithmetic in
-// platformBy(). See README "Trip assistant" for the derivation.
+// THE MODEL NEVER PRODUCES A RELIABILITY NUMBER, AND IT DOES NOT WRITE THE ANSWER.
+// It does one narrow job: PARSE the question into a fixed JSON schema (stops, day,
+// time). Its stop names are not trusted — they are matched against LINES in code.
+// Every figure comes from the database, the platform-by time is arithmetic in
+// platformBy(), and the answer is the fixed TEMPLATE with those figures filled in.
+// See README "Trip assistant" for the derivation.
+//
+// WHY THE MODEL NO LONGER PHRASES THE ANSWER — the limitation is the point.
+// It used to reword the template, writing {placeholders} instead of numbers, and
+// guardPhrasing() rejected any wording with a digit, a number word, or an unknown
+// placeholder. That guard caught every FABRICATED FIGURE it was tested against.
+// On real seeded data it then passed this:
+//     "Most 18% of your Green Line E trips arrive right on time"
+// from a share of 18% of PREDICTIONS landing within a minute. No digit outside a
+// placeholder, no number word, every placeholder valid — and the sentence is false
+// twice: 18% is not most, and the figure measures prediction accuracy, not
+// punctuality. That is a fabricated CLAIM, not a fabricated number, and a check on
+// characters cannot see claims. It is a limit of the guard, not a prompt to tune.
+// The fixed template is the only version whose answer provably matches the data,
+// so it is the only version used. guardPhrasing() is kept, with its tests, as the
+// record of what such a guard can and cannot enforce.
 
 import type { Env } from './collector';
 import { HEADWAY_MIN, RIDE_SEC } from './schedule';
@@ -192,7 +203,7 @@ const DAY_LABEL: Record<DayType, string> = { weekday: 'weekday', saturday: 'Satu
 
 // --- the pipeline -----------------------------------------------------------------
 export type AskResult =
-  | { status: 'ok'; answer: string; phrasing: 'model' | 'template'; guard_reason?: string; facts: Record<string, string>; derivation: Record<string, number | string> }
+  | { status: 'ok'; answer: string; phrasing: 'template'; facts: Record<string, string>; derivation: Record<string, number | string> }
   | { status: 'unparseable' | 'unknown_stop' | 'unanswerable' | 'not_enough_data' | 'need_time' | 'unavailable'; answer: string };
 
 const MIN_N = 20;
@@ -298,22 +309,9 @@ export async function ask(env: Env, db: D1Database, question: string, nowSec: nu
     evaluation_point: bucket, arrival_hour: arrivalHour, day_type: dayType,
   };
 
-  // 6. PHRASE (optional), then GUARD. Any failure falls back to the template.
-  let phrasing: 'model' | 'template' = 'template';
-  let answerText = TEMPLATE;
-  let guardReason: string | undefined;
-  try {
-    const draft = await gemini(env,
-      'Rewrite this answer for a rider in plain, friendly English, at most three sentences. ' +
-      'Keep every {placeholder} exactly as written; never write any number, digit, time or quantity yourself — ' +
-      'only placeholders carry figures. Keep {share}, {origin}, {arrive_by} and {platform_by}. Output only the answer.',
-      TEMPLATE, false);
-    const g = guardPhrasing(draft.trim());
-    if (g.ok) { answerText = draft.trim(); phrasing = 'model'; } else guardReason = g.reason;
-  } catch (err) {
-    guardReason = err instanceof Error ? err.message : String(err);
-  }
-  return { status: 'ok', answer: fill(answerText, facts), phrasing, guard_reason: guardReason, facts, derivation };
+  // 6. ANSWER: the fixed template, every figure from above. The model does not
+  // phrase it — see the header for why a number guard is not enough.
+  return { status: 'ok', answer: fill(TEMPLATE, facts), phrasing: 'template', facts, derivation };
 }
 
 export const __test = { norm, findStops, bucketFor, dayTypeOf, platformBy, guardPhrasing, fill, TEMPLATE };
