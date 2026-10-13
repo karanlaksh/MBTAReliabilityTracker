@@ -547,6 +547,20 @@ slices logged 4, 1 and 3 predictions per direction on 10-02, 10-03 and 10-04, ag
 7,400–12,000 per direction on the weekdays after. So those dates add almost nothing to its
 grid cells, which hold up to seven fewer days than the Orange and Bus 39 slices.
 
+**Orange Line signal maintenance, 2026-10-10 through 10-12.** MBTA alerts 1037687
+(`SERVICE_CHANGE`) and 1038140 (`NOTICE`), both cause `MAINTENANCE`, covered signal work near
+Wellington from 03:00 on 10-10 to 03:00 on 10-13: *"Riders may experience longer than usual
+wait times."* That means less frequent service, not a closure. Unlike the Green-E suspension,
+it removes no service date from any grid cell, because the line kept running and the collector
+recorded what ran. Those dates enter the Orange cells with whatever smaller number of
+predictions the reduced service produced. 10-12 was also Indigenous Peoples' Day.
+
+*Observation, not a finding:* with Green-E restored, Sat–Sun 10-10/10-11 should have stored
+more snapshots than 10-03/10-04, when it was suspended. They came out level instead (21,356 and
+18,684, against 21,838 and 17,399). That is consistent with slower Orange service offsetting
+Green-E's return, but it is unconfirmed. Separating the two needs the per-slice query below
+(~200k reads).
+
 **Per-slice counts from `collector_runs` are not a cheap check.** Splitting predictions by
 slice means unpacking `per_slice_counts` with `json_each`, and D1 counts the unpacked entries
 toward rows read. Over the retained 7 days that query read **212,015 rows** (~4% of the daily
