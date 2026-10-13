@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { DAILY_WRITE_LIMIT, project, utcDayStart } from '../src/status';
+import { DAILY_WRITE_LIMIT, project, snapshotsByServiceDate, utcDayStart } from '../src/status';
 import { classifyError } from '../src/collector';
 import { MbtaError } from '../src/mbta';
 
@@ -123,5 +123,57 @@ describe('classifyError', () => {
     // 'D1_ERROR' plus a limit marker must not be filed as a generic D1 error —
     // the limit label is the actionable one.
     expect(classifyError(new Error('D1_ERROR: quota exceeded'))).toBe('d1_limit');
+  });
+});
+
+describe('snapshotsByServiceDate', () => {
+  const hour = (iso: string, snapshots = 25) => ({
+    hour_start: at(iso),
+    runs: 60,
+    ok_runs: 60,
+    snapshots,
+  });
+
+  it('assigns the hours before 03:00 Boston to the previous service date', () => {
+    // 01:00 and 02:00 EDT on Aug 2 belong to Aug 1; 03:00 starts Aug 2.
+    const days = snapshotsByServiceDate(
+      [
+        hour('2026-08-01T22:00:00-04:00'),
+        hour('2026-08-02T01:00:00-04:00'),
+        hour('2026-08-02T02:00:00-04:00'),
+        hour('2026-08-02T03:00:00-04:00'),
+      ],
+      at('2026-08-03T12:00:00-04:00'),
+    );
+    expect(days.map((d) => [d.service_date, d.snapshots, d.runs])).toEqual([
+      ['2026-08-01', 75, 180],
+      ['2026-08-02', 25, 60],
+    ]);
+  });
+
+  it('follows DST rather than a fixed offset', () => {
+    // 2026-11-01 02:30 EST is 07:30 UTC: still the Oct 31 service date. A fixed
+    // -4h offset in SQL would put it at 03:30 and on Nov 1.
+    const days = snapshotsByServiceDate(
+      [hour('2026-11-01T07:00:00Z')],
+      at('2026-11-05T12:00:00Z'),
+    );
+    expect(days[0].service_date).toBe('2026-10-31');
+  });
+
+  it('marks the oldest date as window_start and the current one as in_progress', () => {
+    const days = snapshotsByServiceDate(
+      [
+        hour('2026-10-02T15:00:00-04:00'),
+        hour('2026-10-03T12:00:00-04:00'),
+        hour('2026-10-09T09:00:00-04:00'),
+      ],
+      at('2026-10-09T10:00:00-04:00'),
+    );
+    expect(days.map((d) => d.partial)).toEqual(['window_start', null, 'in_progress']);
+  });
+
+  it('returns nothing for no runs', () => {
+    expect(snapshotsByServiceDate([], at('2026-10-09T10:00:00-04:00'))).toEqual([]);
   });
 });

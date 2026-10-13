@@ -155,6 +155,64 @@ const ROWS_WRITTEN_SQL =
   'COALESCE(rows_written, snapshots_written + vehicle_rows_written + 2)';
 
 /**
+ * The whole of collector_runs' 7-day retention, as ids. 7 x 1,440 = 10,080; the
+ * margin absorbs manual and concurrent ticks. Same bound as /api/summary.
+ */
+const RUNS_7D_BOUND = 12_000;
+
+export interface RunHour {
+  hour_start: number; // UTC hour boundary, epoch seconds
+  runs: number;
+  ok_runs: number;
+  snapshots: number;
+}
+
+export interface ServiceDateCount {
+  service_date: string;
+  snapshots: number;
+  runs: number;
+  ok_runs: number;
+  /** Why the count is not a whole day, or null if it covers one. */
+  partial: 'window_start' | 'in_progress' | null;
+}
+
+/**
+ * Snapshots per service date, from collector_runs instead of prediction_snapshots.
+ *
+ * The same question asked of prediction_snapshots is a full scan: no secondary
+ * index, by design. On 2026-10-09 one 7-day count read 1,475,191 rows, 30% of the
+ * day's read budget, which is the query shape behind the September outage. This
+ * read 20,185 rows the same day, and stays bounded by retention as history grows.
+ *
+ * Bucketed by UTC hour in SQL, assigned to service dates here. The 03:00 Boston
+ * rollover is always a whole UTC hour (EST and EDT are whole-hour offsets), so
+ * no hour straddles two service dates, and DST is handled by serviceDate()
+ * rather than by a fixed offset in SQL.
+ *
+ * runs and ok_runs come with the count because a low number alone is ambiguous:
+ * fewer predictions, or fewer ticks. They are not a health check on their own;
+ * in September runs stayed at ~1,440 while most of them stored nothing. A full
+ * day is 1,440 runs, but 1,500 on the fall-back date and 1,380 on spring-forward.
+ */
+export function snapshotsByServiceDate(hours: RunHour[], now: number): ServiceDateCount[] {
+  const byDate = new Map<string, ServiceDateCount>();
+  for (const h of hours) {
+    const d = serviceDate(h.hour_start);
+    const c = byDate.get(d) ?? { service_date: d, snapshots: 0, runs: 0, ok_runs: 0, partial: null };
+    c.snapshots += h.snapshots;
+    c.runs += h.runs;
+    c.ok_runs += h.ok_runs;
+    byDate.set(d, c);
+  }
+  const days = [...byDate.values()].sort((a, b) => a.service_date.localeCompare(b.service_date));
+  // Retention is a rolling 7 days, so the oldest retained date begins mid-day.
+  if (days.length > 0) days[0].partial = 'window_start';
+  const current = days.find((c) => c.service_date === serviceDate(now));
+  if (current) current.partial = 'in_progress';
+  return days;
+}
+
+/**
  * Bounded by service_date, not matched_at. Nothing indexes matched_at, so the old
  * `matched_at >= ?` filter read the whole arrivals table on every call. The
  * UNIQUE (service_date, trip_id, stop_id) index makes a service_date range a
@@ -225,7 +283,7 @@ export async function buildStatus(env: Env, now: number): Promise<Record<string,
 async function buildD1Status(env: Env, now: number): Promise<Record<string, unknown>> {
   const dayStart = utcDayStart(now);
 
-  const [last, today, hour, failures] = await Promise.all([
+  const [last, today, hour, failures, runHours] = await Promise.all([
     env.DB.prepare(
       `SELECT started_at, duration_ms, predictions_seen, snapshots_written,
               vehicle_rows_written, rows_written, api_status, error, error_kind,
@@ -274,6 +332,19 @@ async function buildD1Status(env: Env, now: number): Promise<Record<string, unkn
     )
       .bind(dayStart)
       .all<{ error_kind: string; n: number; last_at: number }>(),
+
+    // Snapshots counted only from runs that recorded no error. A failed batch
+    // commits nothing but leaves snapshots_written set; the cost is undercounting
+    // a run that failed after its batch committed (only the hourly prune does).
+    env.DB.prepare(
+      `SELECT (started_at / 3600) * 3600 AS hour_start,
+              COUNT(*) AS runs,
+              SUM(CASE WHEN error IS NULL THEN 1 ELSE 0 END) AS ok_runs,
+              COALESCE(SUM(CASE WHEN error IS NULL THEN snapshots_written END), 0) AS snapshots
+         FROM collector_runs
+        WHERE id > (SELECT MAX(id) FROM collector_runs) - ${RUNS_7D_BOUND}
+        GROUP BY 1`,
+    ).all<RunHour>(),
   ]);
 
   // Bounded window for the derived summaries: the last three service dates
@@ -402,5 +473,8 @@ async function buildD1Status(env: Env, now: number): Promise<Record<string, unkn
         }
       : null,
     snapshots_today: Number(today?.snapshots ?? 0),
+    // Per service date over the retained 7 days. Use this, not a COUNT(*) over
+    // prediction_snapshots: see snapshotsByServiceDate.
+    snapshots_by_service_date: snapshotsByServiceDate(runHours.results ?? [], now),
   };
 }

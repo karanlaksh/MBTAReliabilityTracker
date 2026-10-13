@@ -530,6 +530,30 @@ date (measured locally), ~2.0M for Aug 1–19 by sampling the real id ranges (~5
 snapshots). Spread over two nights, at most ten dates per run, with the run stopping itself
 once the account passes 2.0M reads that UTC day, to keep each day under ~60% of the limit.
 
+**2026-09-28, the first date after the floor, is a partial day.** Its fold read 18,508 rows,
+against 83k–106k for the weekdays after it. It was the last day of the read-budget outage:
+`collection_coverage` shows every run from 03:00 to 19:59 ET refused by the read limit (1,020
+runs, 0 stored), then all 420 runs from 20:00 to 02:59 ET stored once the quota reset at
+00:00 UTC. Because the grid holds sums, a partial day does not skew any cell. It simply
+contributes nothing to Monday's 03:00–19:00 cells and a full evening to Monday's 20:00–02:00
+cells. Monday daytime cells therefore hold one fewer Monday than the evening cells.
+
+**Green-E at Northeastern is missing 2026-09-28 through 10-04, because there was no service.**
+MBTA alert 1033333 (`SUSPENSION`, cause `MAINTENANCE`) closed the Green Line between North
+Station and Heath St from 03:00 on 09-26 to 03:00 on 10-05, and Northeastern sits inside that
+section. This is not a collection gap: `alert_snapshots` recorded the alert at the time, and
+the other eight slices collected normally. For the dates still in `collector_runs`, its two
+slices logged 4, 1 and 3 predictions per direction on 10-02, 10-03 and 10-04, against
+7,400–12,000 per direction on the weekdays after. So those dates add almost nothing to its
+grid cells, which hold up to seven fewer days than the Orange and Bus 39 slices.
+
+**Per-slice counts from `collector_runs` are not a cheap check.** Splitting predictions by
+slice means unpacking `per_slice_counts` with `json_each`, and D1 counts the unpacked entries
+toward rows read. Over the retained 7 days that query read **212,015 rows** (~4% of the daily
+limit), against ~20k for the plain per-day count on `/status`. It also scales with the number
+of watched slices. It is fine for a one-off investigation, but don't run it on a schedule.
+It counts predictions MBTA published, not snapshots stored.
+
 **`rollup_error_by_day`** — service_date x stop x route x direction x bucket x is_added,
 ~55 rows/day. Exists because table 1 has no date dimension and therefore cannot express a
 before/during/after comparison at all.
