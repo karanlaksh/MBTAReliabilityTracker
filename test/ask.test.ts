@@ -1,7 +1,10 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { __test, ask, TEMPLATE } from '../src/ask';
+import { HEADWAY_MIN, RIDE_SEC } from '../src/schedule';
 
 const { guardPhrasing, platformBy, bucketFor, findStops, fill } = __test;
+const stopName = (id: string) =>
+  ({ 'place-forhl': 'Forest Hills', 'place-rugg': 'Ruggles', 'place-masta': 'Massachusetts Ave' } as Record<string, string>)[id] ?? id;
 
 describe('guardPhrasing — the model may not put a number on the screen', () => {
   const good =
@@ -88,13 +91,50 @@ describe('evaluation point for a ride', () => {
 describe('stop resolution — exact aliases, no guessing', () => {
   it('resolves known names and common short forms', () => {
     expect(findStops('Northeastern')[0].stop.id).toBe('place-nuniv');
-    expect(findStops('Park St.')[0].stop.id).toBe('place-pktrm');
+    expect(findStops('Forest Hills')[0].stop.id).toBe('place-forhl');
     expect(findStops('mass ave station')[0].stop.id).toBe('place-masta');
+    expect(findStops('Mass. Ave.')[0].stop.id).toBe('place-masta');
   });
 
   it('returns nothing for a stop not in the data', () => {
     expect(findStops('Kenmore')).toEqual([]);
     expect(findStops('Harvard')).toEqual([]);
+  });
+
+  it('returns nothing for the seeded demo stops the real collector does not watch', () => {
+    for (const s of ['Park Street', 'Park St', 'Copley', 'Prudential', 'Symphony', 'Back Bay', 'Downtown Crossing']) {
+      expect(findStops(s)).toEqual([]);
+    }
+  });
+
+  it('resolves an ambiguous Huntington Ave to both Route 39 stops rather than picking one', () => {
+    expect(findStops('Huntington Ave').map((m) => m.stop.id).sort()).toEqual(['41391', '81317']);
+  });
+});
+
+describe('the schedule table and the stop list agree', () => {
+  it('every scheduled ride is between two known stops, in travel order', () => {
+    for (const key of Object.keys(RIDE_SEC)) {
+      const [route, dir, fromId, toId] = key.split('|');
+      const from = findStops(stopName(fromId)).find((m) => m.route === route);
+      const to = findStops(stopName(toId)).find((m) => m.route === route);
+      expect(from && to, key).toBeTruthy();
+      expect(to!.index > from!.index ? '1' : '0', key).toBe(dir);
+    }
+  });
+
+  it('has a headway table for every origin and day type it can be asked about', () => {
+    for (const key of Object.keys(RIDE_SEC)) {
+      const [route, dir, fromId] = key.split('|');
+      for (const day of ['weekday', 'saturday', 'sunday']) {
+        expect(HEADWAY_MIN[`${route}|${dir}|${fromId}|${day}`], `${key} ${day}`).toBeDefined();
+      }
+    }
+  });
+
+  it('covers exactly the six Orange pairs', () => {
+    expect(Object.keys(RIDE_SEC).length).toBe(6);
+    expect(Object.keys(RIDE_SEC).every((k) => k.startsWith('Orange|'))).toBe(true);
   });
 });
 
@@ -136,7 +176,7 @@ function fakeGemini(phrasing: string) {
     const isParse = body.generationConfig?.responseMimeType === 'application/json';
     calls.push(isParse ? 'parse' : 'phrase');
     const text = isParse
-      ? JSON.stringify({ status: 'ok', origin: 'Northeastern', destination: 'Park Street', route: '', day: 'weekday', arrive_by: '09:00' })
+      ? JSON.stringify({ status: 'ok', origin: 'Forest Hills', destination: 'Massachusetts Ave', route: '', day: 'weekday', arrive_by: '09:00' })
       : phrasing;
     return new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text }] } }] }), { status: 200 });
   });
@@ -151,17 +191,18 @@ describe('ask — end to end', () => {
 
   it('asks the model only to parse: one call, and the answer is the template filled from the database', async () => {
     const calls = fakeGemini('Leave at 8:05 — about 62% of trains are on time.');
-    const r = await ask(env, fakeDb(), 'Northeastern to Park St by 9am on a weekday?', NOW);
+    const r = await ask(env, fakeDb(), 'Forest Hills to Mass Ave by 9am on a weekday?', NOW);
     expect(calls).toEqual(['parse']); // no phrasing call at all
     expect(r.status).toBe('ok');
     if (r.status !== 'ok') return;
     expect(r.phrasing).toBe('template');
     expect(r.answer).not.toMatch(/8:05|62%/);
     // The real figures: 34% from the grid (170/500), the computed platform-by time.
-    expect(r.answer).toContain('34% of predictions at Park Street land within a minute');
-    expect(r.answer).toContain('be on the platform at Northeastern by 8:30am');
+    expect(r.answer).toContain('34% of predictions at Massachusetts Ave land within a minute');
+    // 9:00 - 9 min ride - 5 min headway - 356s p90 = 8:40:04 -> 8:40.
+    expect(r.answer).toContain('be on the platform at Forest Hills by 8:40am');
     expect(r.answer).not.toMatch(/[{}]/); // every placeholder filled
-    expect(r.derivation).toMatchObject({ ride_sec: 780, p90_sec: 356, platform_by: '8:30am', evaluation_point: '~16 min' });
+    expect(r.derivation).toMatchObject({ ride_sec: 540, headway_min: 5, p90_sec: 356, platform_by: '8:40am', evaluation_point: '~9 min' });
   });
 
   it('says so plainly for a stop not in the data', async () => {
@@ -180,7 +221,33 @@ describe('ask — end to end', () => {
     vi.stubGlobal('fetch', async () => new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: JSON.stringify({ status: 'ok', origin: 'Northeastern', destination: 'Ruggles', route: '', day: '', arrive_by: '09:00' }) }] } }] })));
     const r = await ask(env, fakeDb(), 'Northeastern to Ruggles by 9?', NOW);
     expect(r.status).toBe('unanswerable');
-    expect(r.answer).toMatch(/no single route/);
+    expect(r.answer).toMatch(/no trip in my data from Northeastern to Ruggles/);
+  });
+
+  it('refuses a trip between the two Route 39 stops: they serve opposite directions', async () => {
+    vi.stubGlobal('fetch', async () => new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: JSON.stringify({ status: 'ok', origin: 'Opera Place', destination: '360 Huntington Ave', route: '', day: '', arrive_by: '09:00' }) }] } }] })));
+    const r = await ask(env, fakeDb(), 'Opera Place to 360 Huntington Ave by 9?', NOW);
+    expect(r.status).toBe('unanswerable');
+  });
+
+  it('refuses a stop that was in the demo data but is not collected', async () => {
+    vi.stubGlobal('fetch', async () => new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: JSON.stringify({ status: 'ok', origin: 'Ruggles', destination: 'Back Bay', route: '', day: '', arrive_by: '09:00' }) }] } }] })));
+    const r = await ask(env, fakeDb(), 'Ruggles to Back Bay by 9?', NOW);
+    expect(r.status).toBe('unknown_stop');
+    expect(r.answer).toMatch(/don’t have data for “Back Bay”/);
+  });
+
+  it('reads the grid by its full primary key, weekday included', async () => {
+    fakeGemini('unused');
+    const seen: { sql: string; args: unknown[] }[] = [];
+    const db = fakeDb();
+    const spy = {
+      prepare: (sql: string) => ({ bind: (...args: unknown[]) => { seen.push({ sql, args }); return db.prepare(sql).bind(...args); } }),
+    } as unknown as D1Database;
+    await ask(env, spy, 'Forest Hills to Mass Ave by 9am on a weekday?', NOW);
+    const grid = seen.find((s) => s.sql.includes('rollup_grid_totals'))!;
+    expect(grid.sql).toMatch(/weekday IN \(\?,\?,\?,\?,\?\)/);
+    expect(grid.args).toEqual(['place-masta', 'Orange', 1, 1, 2, 3, 4, 5, 8, '~9 min']);
   });
 
   it('refuses rather than guesses when the cell is too thin', async () => {
@@ -188,14 +255,14 @@ describe('ask — end to end', () => {
     const thin = {
       prepare: (sql: string) => ({ bind: () => ({ all: async () => ({ results: sql.includes('rollup_grid_totals') ? [{ weekday: 1, n: 7, n_within_60: 3 }] : [] }) }) }),
     } as unknown as D1Database;
-    const r = await ask(env, thin, 'Northeastern to Park St by 9am on a weekday?', NOW);
+    const r = await ask(env, thin, 'Forest Hills to Mass Ave by 9am on a weekday?', NOW);
     expect(r.status).toBe('not_enough_data');
     expect(r.answer).toMatch(/n=7/);
   });
 
   it('asks for an arrival time rather than inventing one', async () => {
-    vi.stubGlobal('fetch', async () => new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: JSON.stringify({ status: 'ok', origin: 'Northeastern', destination: 'Park Street', route: '', day: 'weekday', arrive_by: '' }) }] } }] })));
-    expect((await ask(env, fakeDb(), 'Northeastern to Park St?', NOW)).status).toBe('need_time');
+    vi.stubGlobal('fetch', async () => new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: JSON.stringify({ status: 'ok', origin: 'Forest Hills', destination: 'Massachusetts Ave', route: '', day: 'weekday', arrive_by: '' }) }] } }] })));
+    expect((await ask(env, fakeDb(), 'Forest Hills to Mass Ave?', NOW)).status).toBe('need_time');
   });
 
   it('retries an overloaded model rather than failing the question', async () => {
@@ -206,11 +273,11 @@ describe('ask — end to end', () => {
       if (n === 1) return new Response('overloaded', { status: 503 }); // first parse attempt
       const isParse = n === 2;
       const text = isParse
-        ? JSON.stringify({ status: 'ok', origin: 'Northeastern', destination: 'Park Street', route: '', day: 'weekday', arrive_by: '09:00' })
+        ? JSON.stringify({ status: 'ok', origin: 'Forest Hills', destination: 'Massachusetts Ave', route: '', day: 'weekday', arrive_by: '09:00' })
         : 'unused';
       return new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text }] } }] }));
     });
-    const r = await ask(env, fakeDb(), 'Northeastern to Park St by 9am on a weekday?', NOW);
+    const r = await ask(env, fakeDb(), 'Forest Hills to Mass Ave by 9am on a weekday?', NOW);
     vi.useRealTimers();
     expect(r.status).toBe('ok');
     expect(n).toBe(2); // 503, then the retried parse; no phrasing call
@@ -222,7 +289,7 @@ describe('ask — end to end', () => {
       n++;
       return new Response('bad request', { status: 400 });
     });
-    const r = await ask(env, fakeDb(), 'Northeastern to Park St by 9am on a weekday?', NOW);
+    const r = await ask(env, fakeDb(), 'Forest Hills to Mass Ave by 9am on a weekday?', NOW);
     expect(r.status).toBe('unavailable');
     expect(n).toBe(1);
   });

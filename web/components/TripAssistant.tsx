@@ -3,7 +3,7 @@
 import { useState } from 'react';
 
 /**
- * DEMO ONLY — "so should I leave earlier?", answered from the rollup tables.
+ * "So should I leave earlier?", answered from the rollup tables.
  *
  * The Worker (src/ask.ts) does all of it: a model parses the question into a
  * fixed schema, code looks the figures up and computes the platform-by time, and
@@ -23,13 +23,17 @@ type Result =
     }
   | { status: string; answer: string };
 
-/** Short label on the pill; the full question is what is sent. Nothing is truncated. */
+/**
+ * Short label on the pill; the full question is what is sent. Nothing is truncated.
+ * Only trips the real data can answer (Orange, between Forest Hills, Ruggles and
+ * Massachusetts Ave), plus one stop that is not collected, to show the refusal.
+ */
 const EXAMPLES = [
   {
-    label: '9am interview at Park Street, from Northeastern',
-    question: 'I have a 9am interview at Park Street. Leaving from Northeastern on a weekday — when should I be on the platform?',
+    label: '9am class near Mass Ave, from Forest Hills',
+    question: 'I have a 9am class near Massachusetts Ave. Leaving from Forest Hills on a weekday — when should I be on the platform?',
   },
-  { label: 'Ruggles → Downtown Crossing by 5:30pm Friday', question: 'Ruggles to Downtown Crossing, arriving by 5:30pm on Friday' },
+  { label: 'Ruggles → Forest Hills by 5:30pm Friday', question: 'Ruggles to Forest Hills, arriving by 5:30pm on Friday' },
   { label: 'Kenmore → Park Street by 9am', question: 'Kenmore to Park Street by 9am' },
 ];
 
@@ -75,7 +79,7 @@ export default function TripAssistant({ apiBase }: { apiBase: string }) {
           id="trip-question"
           value={question}
           onChange={(e) => setQuestion(e.target.value)}
-          placeholder="e.g. Northeastern to Park Street, arriving by 9am on a weekday"
+          placeholder="e.g. Forest Hills to Mass Ave, arriving by 9am on a weekday"
           maxLength={300}
           className="flex-1 rounded-md border border-[var(--rule)] bg-[var(--surface-1)] px-3 py-2 text-sm text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:border-[var(--text-muted)] focus:outline-none"
         />

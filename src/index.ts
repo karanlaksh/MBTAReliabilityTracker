@@ -84,13 +84,13 @@ export default {
     // Read-only API for the frontend, served entirely from the rollup tables.
     // Never from prediction_snapshots: no secondary index, 518k rows now and ~3M
     // by November.
-    // DEMO ONLY — trip assistant (src/ask.ts). POST {question}, answered from the
-    // seeded mbta-demo database. There is deliberately no /api/ask on the real
-    // database: the panel only exists in DEMO_MODE, and an unused public endpoint
-    // would spend the real read budget. Rate-limited per client anyway: every
-    // question reads D1 — whose daily read budget is shared, account-wide, with
-    // the live collector — and spends Gemini free-tier quota.
-    if (url.pathname === '/demo/api/ask') {
+    // Trip assistant (src/ask.ts). POST {question}. /api/ask answers from the real
+    // database; /demo/api/ask from the seeded mbta-demo one, the same split as
+    // every other /demo/api/* path. The database is chosen by the path, never by
+    // a client parameter. Rate-limited per client: every question reads D1 (~80
+    // rows on the real database — see ask.ts), whose daily read budget is shared,
+    // account-wide, with the live collector, and spends Gemini free-tier quota.
+    if (url.pathname === '/api/ask' || url.pathname === '/demo/api/ask') {
       const cors = {
         'access-control-allow-origin': '*',
         'access-control-allow-methods': 'POST, OPTIONS',
@@ -98,7 +98,7 @@ export default {
       };
       if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors });
       if (request.method !== 'POST') return json({ error: 'POST only' }, 405);
-      const db = env.DB_DEMO;
+      const db = url.pathname === '/api/ask' ? env.DB : env.DB_DEMO;
       if (!db) return json({ error: 'demo database not bound' }, 404);
       const client = request.headers.get('cf-connecting-ip') ?? 'unknown';
       if (env.ASK_LIMITER && !(await env.ASK_LIMITER.limit({ key: client })).success) {

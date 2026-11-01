@@ -48,6 +48,16 @@ Every index adds an extra written row whenever an indexed column is written.
 
 - `prediction_snapshots` has **no secondary index**. Deliberate. Matching and rollups
   scan. Do not add an index to it without recalculating the write budget.
+- **`rollup_error_by_day` has one secondary index (`idx_by_day_slice`, migration 0012),
+  and that does not contradict the rule above.** The rule is about which resource is
+  binding for which table. `prediction_snapshots` takes ~31–34k writes a weekday
+  (measured Oct 26–30, 2026), so an index there would add about a third of the 100k/day
+  cap. `rollup_error_by_day` takes ~180 inserts and ~180 deletes a day (3 service dates
+  per rollup run), so its index costs ~360 writes/day, ~0.4% of the cap. In exchange the
+  trip assistant's day-level lookup reads 71 rows instead of scanning the whole table
+  (3,890 rows on 2026-11-01, growing ~55–60 a day) — a per-question cost that scaled with
+  accumulated data, the September read-exhaustion pattern. Writes are the binding resource
+  for the snapshot table; reads that grow with history were the binding risk here.
 - The prediction error is **never stored**. It is a pure function of a snapshot and an
   arrival, computed at rollup time.
 - **The typical-week grid uses composable statistics so that rule can hold.** Each cell
@@ -74,7 +84,8 @@ Rough budget at 3–4 watched stops:
 | vehicle_observations  |     ~5,000 |
 | arrivals (+ 1 index)  |     ~1,600 |
 | rollups               |     ~2,000 |
-| **Total**             | **~48,000** |
+| rollup_error_by_day index (0012) | ~360 |
+| **Total**             | **~48,400** |
 
 Headroom for roughly 6–8 stops. Before adding stops, check actual usage in the
 Cloudflare dashboard under D1 > Metrics > Row Metrics.

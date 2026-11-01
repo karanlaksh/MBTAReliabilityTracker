@@ -27,29 +27,37 @@ import { HEADWAY_MIN, RIDE_SEC } from './schedule';
 import { serviceDate } from './service-date';
 
 // --- stops the assistant knows ---------------------------------------------
-// Travel order is DIRECTION 1 (Green-E inbound; Orange northbound); direction 0
-// runs the other way. Route 39's two stops serve one direction each, so no trip
-// between them exists in this data.
+// Exactly the six watched stops the collector records — nothing else, so a stop
+// we do not collect can only be refused, never approximated. Travel order is
+// DIRECTION 1 (Orange northbound). A stop being known does not make a trip
+// answerable: that takes a scheduled ride in RIDE_SEC, and only the three Orange
+// stations form pairs. Northeastern is the only Green-E stop, and Route 39's two
+// stops serve one direction each, so no trip between them exists in this data.
+// They are listed so the refusal says "no trip", not the false "no data".
 interface StopDef { id: string; name: string; aliases: string[] }
 const LINES: Record<string, StopDef[]> = {
-  'Green-E': [
-    { id: 'place-nuniv', name: 'Northeastern', aliases: ['northeastern', 'northeastern university', 'neu'] },
-    { id: 'place-symcl', name: 'Symphony', aliases: ['symphony'] },
-    { id: 'place-prmnl', name: 'Prudential', aliases: ['prudential', 'pru'] },
-    { id: 'place-coecl', name: 'Copley', aliases: ['copley', 'copley square'] },
-    { id: 'place-pktrm', name: 'Park Street', aliases: ['park street', 'park st', 'park'] },
-  ],
   Orange: [
     { id: 'place-forhl', name: 'Forest Hills', aliases: ['forest hills'] },
     { id: 'place-rugg', name: 'Ruggles', aliases: ['ruggles'] },
-    { id: 'place-masta', name: 'Massachusetts Ave', aliases: ['massachusetts ave', 'massachusetts avenue', 'mass ave'] },
-    { id: 'place-bbsta', name: 'Back Bay', aliases: ['back bay'] },
-    { id: 'place-dwnxg', name: 'Downtown Crossing', aliases: ['downtown crossing', 'dtx'] },
+    { id: 'place-masta', name: 'Massachusetts Ave', aliases: ['massachusetts ave', 'massachusetts avenue', 'mass ave', 'mass av'] },
+  ],
+  'Green-E': [
+    { id: 'place-nuniv', name: 'Northeastern', aliases: ['northeastern', 'northeastern university', 'neu'] },
+  ],
+  // norm() drops digits, so "360 Huntington Ave" reads as "huntington ave" and
+  // matches both stops; either way no trip pairs with them.
+  '39': [
+    { id: '41391', name: 'Huntington Ave @ Opera Pl', aliases: ['huntington ave opera pl', 'huntington ave opera place', 'huntington ave at opera pl', 'opera pl', 'opera place', 'huntington ave', 'huntington avenue'] },
+    { id: '81317', name: '360 Huntington Ave', aliases: ['huntington ave', 'huntington avenue'] },
   ],
 };
 const ROUTE_NAME: Record<string, string> = { 'Green-E': 'Green Line E', Orange: 'Orange Line', '39': 'Bus 39' };
 /** A route the user named must contain one of these, or the trip is rejected. */
-const ROUTE_WORDS: Record<string, string[]> = { 'Green-E': ['green', 'e line', 'e branch'], Orange: ['orange'] };
+const ROUTE_WORDS: Record<string, string[]> = { 'Green-E': ['green', 'e line', 'e branch'], Orange: ['orange'], '39': ['bus', 'route'] };
+const COVERAGE =
+  'I collect six stops: Forest Hills, Ruggles and Massachusetts Ave on the Orange Line, Northeastern on the ' +
+  'Green Line E, and two Huntington Ave stops on Bus 39. The trips I can answer are on the Orange Line between ' +
+  'Forest Hills, Ruggles and Massachusetts Ave.';
 
 const norm = (s: string) => s.toLowerCase().replace(/[^a-z ]/g, ' ').replace(/\s+/g, ' ').trim()
   .replace(/\bstation\b/g, '').replace(/\bstop\b/g, '').trim();
@@ -210,7 +218,7 @@ const MIN_N = 20;
 
 export async function ask(env: Env, db: D1Database, question: string, nowSec: number): Promise<AskResult> {
   const q = question.trim().slice(0, 300);
-  if (!q) return { status: 'unparseable', answer: 'Ask me about a trip, for example: "Northeastern to Park Street, arriving by 9am tomorrow."' };
+  if (!q) return { status: 'unparseable', answer: 'Ask me about a trip, for example: "Forest Hills to Massachusetts Ave, arriving by 9am tomorrow."' };
 
   // 1. PARSE. Today's date goes in so "tomorrow" and "Tuesday" resolve; nothing else.
   const today = serviceDate(nowSec);
@@ -224,7 +232,7 @@ export async function ask(env: Env, db: D1Database, question: string, nowSec: nu
     return { status: 'unavailable', answer: 'The assistant could not read that question just now. Try again in a moment.' };
   }
   if (parsed.status !== 'ok') {
-    return { status: 'unparseable', answer: 'I couldn’t tell which trip you mean. Try: "Northeastern to Park Street, arriving by 9am on a weekday."' };
+    return { status: 'unparseable', answer: 'I couldn’t tell which trip you mean. Try: "Forest Hills to Massachusetts Ave, arriving by 9am on a weekday."' };
   }
   if (!parsed.origin || !parsed.destination) {
     return { status: 'unparseable', answer: 'I need both where you’re starting and where you’re going.' };
@@ -232,15 +240,20 @@ export async function ask(env: Env, db: D1Database, question: string, nowSec: nu
 
   // 2. RESOLVE in code: the model's stop names are matched, never trusted.
   const from = findStops(parsed.origin), to = findStops(parsed.destination);
-  if (!from.length) return { status: 'unknown_stop', answer: `I don’t have data for “${parsed.origin}”. I cover the Green Line E from Northeastern to Park Street and the Orange Line from Forest Hills to Downtown Crossing.` };
-  if (!to.length) return { status: 'unknown_stop', answer: `I don’t have data for “${parsed.destination}”. I cover the Green Line E from Northeastern to Park Street and the Orange Line from Forest Hills to Downtown Crossing.` };
-  const pair = from.flatMap((f) => to.filter((t) => t.route === f.route && t.index !== f.index).map((t) => ({ f, t })))[0];
-  if (!pair) return { status: 'unanswerable', answer: `There’s no single route in my data from ${from[0].stop.name} to ${to[0].stop.name}.` };
+  if (!from.length) return { status: 'unknown_stop', answer: `I don’t have data for “${parsed.origin}”. ${COVERAGE}` };
+  if (!to.length) return { status: 'unknown_stop', answer: `I don’t have data for “${parsed.destination}”. ${COVERAGE}` };
+  // A pair is a trip only if MBTA schedules a ride for it: same route, travel
+  // order, and a RIDE_SEC entry. Everything else is refused, not approximated.
+  const pair = from.flatMap((f) => to
+    .filter((t) => t.route === f.route && t.index !== f.index)
+    .map((t) => ({ f, t, dir: t.index > f.index ? 1 : 0 }))
+    .filter(({ t, dir }) => RIDE_SEC[`${f.route}|${dir}|${f.stop.id}|${t.stop.id}`] !== undefined))[0];
+  if (!pair) return { status: 'unanswerable', answer: `There’s no trip in my data from ${from[0].stop.name} to ${to[0].stop.name}. ${COVERAGE}` };
   const route = pair.f.route;
   if (parsed.route && !ROUTE_WORDS[route].some((w) => norm(parsed.route).includes(w))) {
-    return { status: 'unanswerable', answer: `${from[0].stop.name} to ${to[0].stop.name} is on the ${ROUTE_NAME[route]}, not the ${parsed.route}.` };
+    return { status: 'unanswerable', answer: `${pair.f.stop.name} to ${pair.t.stop.name} is on the ${ROUTE_NAME[route]}, not the ${parsed.route}.` };
   }
-  const dir = pair.t.index > pair.f.index ? 1 : 0;
+  const dir = pair.dir;
   const origin = pair.f.stop, dest = pair.t.stop;
 
   if (!/^\d{1,2}:\d{2}$/.test(parsed.arrive_by)) {
@@ -261,21 +274,29 @@ export async function ask(env: Env, db: D1Database, question: string, nowSec: nu
 
   // 3. SCHEDULE: ride time and headway, from MBTA's published schedules.
   const rideSec = RIDE_SEC[`${route}|${dir}|${origin.id}|${dest.id}`];
-  if (rideSec === undefined) return { status: 'unanswerable', answer: `I don’t have a scheduled ride time from ${origin.name} to ${dest.name}.` };
   const departHour = Math.floor(((arriveSec - rideSec + 86_400) % 86_400) / 3600);
-  const hwTable = HEADWAY_MIN[`${route}|${dir}|${dayType}`];
+  const hwTable = HEADWAY_MIN[`${route}|${dir}|${origin.id}|${dayType}`];
   const headway = hwTable?.[departHour];
   if (headway === undefined) {
     return { status: 'unanswerable', answer: `The ${ROUTE_NAME[route]} has no scheduled service from ${origin.name} around ${hourName(departHour)} on ${DAY_LABEL[dayType]}s.` };
   }
 
   // 4. FIGURES, from the database. The grid gives the hour; by_day gives the day.
+  //
+  // READ COST, measured on the real database 2026-11-01: 72-81 rows per answered
+  // question. The grid query names every primary-key column, weekday included, so
+  // it is point lookups: 1-10 rows (959 without weekday, which stops the key
+  // prefix at direction_id). The by_day query uses idx_by_day_slice (migration
+  // 0012): 71 rows, growing ~1 a day. Without that index it scans the whole table,
+  // because the primary key leads with service_date — 3,890 rows, growing ~55-60
+  // a day. Keep every filter below an equality on an index column.
   const bucket = bucketFor(rideSec);
   const arrivalHour = Math.floor(((arriveSec - 60 + 86_400) % 86_400) / 3600);
   const grid = (await db.prepare(
     `SELECT weekday, n, n_within_60 FROM rollup_grid_totals
-      WHERE stop_id = ? AND route_id = ? AND direction_id = ? AND hour = ? AND horizon_bucket = ? AND is_added = 0`,
-  ).bind(dest.id, route, dir, arrivalHour, bucket).all<{ weekday: number; n: number; n_within_60: number }>()).results ?? [];
+      WHERE stop_id = ? AND route_id = ? AND direction_id = ? AND weekday IN (${days.map(() => '?').join(',')})
+        AND hour = ? AND horizon_bucket = ? AND is_added = 0`,
+  ).bind(dest.id, route, dir, ...days, arrivalHour, bucket).all<{ weekday: number; n: number; n_within_60: number }>()).results ?? [];
   const cells = grid.filter((c) => days.includes(c.weekday));
   const nHour = cells.reduce((t, c) => t + c.n, 0);
   const within = cells.reduce((t, c) => t + c.n_within_60, 0);

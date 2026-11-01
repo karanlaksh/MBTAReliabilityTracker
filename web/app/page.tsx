@@ -148,18 +148,16 @@ export default async function Page() {
         />
       </section>
 
-      {/* DEMO ONLY: the trip assistant. Absent unless DEMO_MODE (lib/mode.ts). */}
-      {DEMO_MODE ? (
-        <section className="mb-14">
-          <h2 className="text-lg font-semibold">So should I leave earlier?</h2>
-          <p className="mb-5 mt-1 max-w-2xl text-sm text-[var(--text-secondary)]">
-            Ask about a trip and a time you need to arrive. The answer uses the same figures as the
-            charts above &mdash; the share within a minute for that hour, and the day&rsquo;s median
-            and 90th-percentile miss &mdash; and ends in a time to be on the platform.
-          </p>
-          <TripAssistant apiBase={`${WORKER_BASE}${API_PREFIX}`} />
-        </section>
-      ) : null}
+      {/* The trip assistant. Shown in both modes; API_PREFIX picks the database. */}
+      <section className="mb-14">
+        <h2 className="text-lg font-semibold">So should I leave earlier?</h2>
+        <p className="mb-5 mt-1 max-w-2xl text-sm text-[var(--text-secondary)]">
+          Ask about a trip and a time you need to arrive. The answer uses the same figures as the
+          charts above &mdash; the share within a minute for that hour, and the day&rsquo;s median
+          and 90th-percentile miss &mdash; and ends in a time to be on the platform.
+        </p>
+        <TripAssistant apiBase={`${WORKER_BASE}${API_PREFIX}`} />
+      </section>
 
       {/* 4. COLLECTION STATUS, with the degraded banner directly above it. */}
       {!DEMO_MODE ? <DegradedBanner messages={problems} /> : null}
