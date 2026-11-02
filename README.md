@@ -745,12 +745,28 @@ required before then, not optional.
 `rollup_error_by_day` stores one median per (date, slice, bucket), and medians do not
 compose, so `/api/error-by-horizon` cannot produce a true pooled median over a date
 range. `n` is exact; the median and p90 are weighted means. Checked against a pooled
-computation over raw rows and the headline is unchanged either way (bus +27s vs
-Orange +4s), and the API response carries a `method` field saying so. The fix is a
+computation over raw rows when the headline window was Aug 1–19, and the headline was
+unchanged either way (bus +27s vs Orange +4s); not yet re-checked for October. And the API response carries a `method` field saying so. The fix is a
 route-grain pooled rollup alongside the existing two. Required before any figure
 from this project is published as a precise statistic.
 
-**D1 error 7403 occurs spuriously.** Observed 2026-08-02 and 2026-08-10, both times with
+**Two scheduled rollups did nothing, with no error, and left a date stale.** On Oct 25 and
+Oct 26 the 04:00 ET rollup recomputed no service date at all: every `rollup_error_by_day`
+row from Oct 21 on carries a `computed_at` of Oct 24, Oct 27 or later, none from Oct 25–26.
+The cause is not yet known — the rollup is skipped, with only a log line, when the
+Cloudflare usage lookup fails or the day's reads are over threshold (`src/index.ts`), and
+which one happened has not been checked. Each run rewrites only the last 3 service dates
+(`BY_DAY_RECENT_DAYS`), so when runs resumed on Oct 27 they covered Oct 25–27 and **Oct 24
+was left as the 3-prediction partial row written while it was still the open day**. It was
+collected and matched normally (1,078 graded arrivals; the grid folded it). Nothing reports
+this: no error, no alert, and the headline simply excludes partial days. That is the same
+shape as the September outage, a failure visible only to someone who goes looking. Not
+fixed. Repair for the date: `POST /rollup?date=2026-10-24`. Fix for the class: have each
+run also recompute any `is_partial = 1` date older than the open day, and surface skipped
+runs on `/status`.
+
+**D1 error 7403 occurs spuriously.** Observed 2026-08-02, 2026-08-10, 2026-11-01 and
+2026-11-02, both times with
 valid auth, correct account, and `d1 (write)` scope present; the identical query succeeded
 seconds later. Retry before debugging credentials.
 
@@ -765,8 +781,8 @@ seconds later. Retry before debugging credentials.
   by the end. Every rush hour in that window is missing and cannot be recovered, because
   MBTA predictions are overwritten as they change. The cause was found with
   `wrangler d1 insights`, which showed that one query accounted for 91% of all rows read. It
-  was fixed with a partial index. The headline figures use Aug 1–19; the September dates
-  are shown as a gap and not plotted.
+  was fixed with a partial index. The headline figures use Oct 1 onward; the September
+  dates are shown as a gap on the day-by-day chart and not plotted.
 - **The outage ran for four weeks because the monitoring was watching the wrong thing.**
   The collector logged all ~1,440 of its runs every day, and ~1,100 of them had been
   refused. The run log looked complete, because recording a run is a write and only reads
@@ -779,14 +795,21 @@ seconds later. Retry before debugging credentials.
 - **Aug 18 and Aug 20–30 are suspect.** On those days 30–43% of arrivals were left
   unmatched, against 1–5% on every other August day. Collection volume was normal, so
   something went wrong in matching or in the vehicle data, and the cause is not yet
-  known. Aug 18 falls inside the headline window. Removing it moves the headline by under a
-  second (Bus 39 at ~1.5 min: +29.4s with it, +29.7s without).
+  known. They are outside the headline window, which starts Oct 1.
 - **The Green Line E diversion splits the record.** The E branch was suspended
   Aug 1-2 and again Aug 8-16, so `place-nuniv` reports zero predictions on those
   dates. That is real absence of service, not a collection gap. The branch
   returned Aug 17, so a clean before/during/after comparison is only now becoming
   possible — with just two post-return weekdays so far it is not yet answerable,
   and needs a full week of Aug 17+ data before it means anything.
+- **Three things inside the headline window, and what each does to it.** Orange Line
+  signal maintenance near Wellington, Oct 10–12, warned of longer waits: removing those
+  three dates moves no headline median by more than 5s (Orange at ~16 min: +37.2s with
+  them, +40.0s without; Orange at ~1.5 min unchanged at +4s). The Green Line was suspended
+  through Northeastern Oct 31–Nov 1, so Green-E has no predictions those days — absence of
+  service, not a collection gap. And Oct 24 is missing from the day-level figures because
+  its rollup was never finalised (see Known issues); the window label says so, as "31 of
+  32 service dates", until it is re-run.
 - **Arrival timestamps carry roughly ±30s of uncertainty.** The collector polls
   once a minute, and actual arrival is taken from MBTA's own `updated_at` at the
   observation where a vehicle reports `STOPPED_AT`. That is far tighter than

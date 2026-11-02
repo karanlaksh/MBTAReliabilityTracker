@@ -143,6 +143,20 @@ export async function errorByHorizon(env: Env, url: URL): Promise<Response> {
     });
   }
 
+  // The dates actually graded, so a caller passing only `from` can label the
+  // window truthfully: complete days only (unless include_partial), and `days`
+  // counts the service dates present, so a date missing from the rollup shows
+  // as days < the calendar span rather than vanishing silently.
+  const span = await env.DB.prepare(
+    `SELECT MIN(d.service_date) AS first, MAX(d.service_date) AS last,
+            COUNT(DISTINCT d.service_date) AS days
+       FROM rollup_error_by_day d
+       LEFT JOIN (SELECT DISTINCT stop_id, mode FROM watched_stops) w ON w.stop_id = d.stop_id
+      WHERE ${sql}`,
+  )
+    .bind(...binds)
+    .first<{ first: string | null; last: string | null; days: number }>();
+
   const series = [...byRoute.values()].map((s) => ({
     ...s,
     points: s.points.sort(
@@ -158,6 +172,7 @@ export async function errorByHorizon(env: Env, url: URL): Promise<Response> {
     method:
       'n is exact; median_sec and p90_sec are n-weighted means of per-day medians, not pooled medians',
     filters: f,
+    span: { first: span?.first ?? null, last: span?.last ?? null, days: Number(span?.days ?? 0) },
     series,
   });
 }

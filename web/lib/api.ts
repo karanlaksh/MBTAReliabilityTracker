@@ -9,10 +9,42 @@ export const WORKER_BASE =
 /**
  * The primary analysis window: the headline finding and the mode comparison are
  * graded over these dates only, not pooled across all time. A pooled figure
- * would average complete August days together with the partial days of the
- * September read-limit outage, which is not a like-for-like comparison.
+ * would average complete days together with the partial days of the September
+ * read-limit outage, which is not a like-for-like comparison.
+ *
+ * October onward, open-ended: `to` is null, so the Worker grades every complete
+ * service date from Oct 1 (partial days are excluded by default) and the window
+ * keeps up on its own. October is the first full month with every watched slice
+ * running and collection clean; it replaced Aug 1–19, which was chosen when
+ * August was the only complete data. `label` is only the fallback — the page
+ * labels the window from the span the Worker reports it actually graded
+ * (windowLabel below).
  */
-export const PRIMARY_WINDOW = { from: '2026-08-01', to: '2026-08-19', label: 'Aug 1–19, 2026' } as const;
+export const PRIMARY_WINDOW: { from: string; to: string | null; label: string } = {
+  from: '2026-10-01',
+  to: null,
+  label: 'Oct 1, 2026 onward',
+};
+
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sept', 'Oct', 'Nov', 'Dec'];
+const dayCount = (a: string, b: string) => Math.round((Date.parse(`${b}T12:00:00Z`) - Date.parse(`${a}T12:00:00Z`)) / 86_400_000) + 1;
+
+/**
+ * "Oct 1 – Nov 1, 2026", from the dates the figures were actually graded over.
+ * If any service date in that span is absent, says how many are present — a
+ * label must not claim a day the figures do not contain.
+ */
+export function windowLabel(span: HorizonSpan | undefined, fallback: string): string {
+  if (!span?.first || !span.last) return fallback;
+  const [y1, m1, d1] = span.first.split('-').map(Number);
+  const [y2, m2, d2] = span.last.split('-').map(Number);
+  const range =
+    y1 !== y2 ? `${MONTHS[m1 - 1]} ${d1}, ${y1} – ${MONTHS[m2 - 1]} ${d2}, ${y2}`
+      : m1 !== m2 ? `${MONTHS[m1 - 1]} ${d1} – ${MONTHS[m2 - 1]} ${d2}, ${y2}`
+        : `${MONTHS[m1 - 1]} ${d1}–${d2}, ${y2}`;
+  const calendar = dayCount(span.first, span.last);
+  return span.days < calendar ? `${range} (${span.days} of ${calendar} service dates)` : range;
+}
 
 /**
  * Service dates degraded by the September read-limit outage: collection ran only
@@ -67,10 +99,18 @@ export interface HorizonSeries {
   label: string;
   points: HorizonPoint[];
 }
+/** The service dates a horizon response was graded over. Absent from an older Worker. */
+export interface HorizonSpan {
+  first: string | null;
+  last: string | null;
+  days: number;
+}
+
 export interface HorizonResponse {
   sign_convention: string;
   bucket_order: string[];
   method: string;
+  span?: HorizonSpan;
   series: HorizonSeries[];
 }
 

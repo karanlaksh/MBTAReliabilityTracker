@@ -17,7 +17,9 @@ export const DEMO_MODE = process.env.DEMO_MODE === 'true';
 export const API_PREFIX = DEMO_MODE ? '/demo' : '';
 
 /** The seeded range: three continuous months. */
-const DEMO_WINDOW = { from: '2026-07-01', to: '2026-09-30', label: 'Jul 1 – Sep 30, 2026' } as const;
+const DEMO_WINDOW: { from: string; to: string | null; label: string } = {
+  from: '2026-07-01', to: '2026-09-30', label: 'Jul 1 – Sep 30, 2026',
+};
 
 /** Window the headline finding and mode comparison are graded over. */
 export const HEADLINE_WINDOW = DEMO_MODE ? DEMO_WINDOW : PRIMARY_WINDOW;

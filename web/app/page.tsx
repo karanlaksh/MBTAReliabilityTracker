@@ -11,9 +11,9 @@ import { API_PREFIX, BREAK_WINDOW, DEMO_MODE, HEADLINE_WINDOW } from '@/lib/mode
 import {
   DEFAULT_GRID_SLICE,
   DEGRADED_WINDOW,
-  PRIMARY_WINDOW,
   WORKER_BASE,
   getJson,
+  windowLabel,
   type DayResponse,
   type HorizonResponse,
   type SliceResponse,
@@ -37,7 +37,8 @@ export default async function Page() {
     // not pooled across the September outage. The day-by-day series is not
     // windowed: it shows everything, with the outage as a labelled gap.
     getJson<HorizonResponse>(
-      `${API_PREFIX}/api/error-by-horizon?from=${HEADLINE_WINDOW.from}&to=${HEADLINE_WINDOW.to}`,
+      `${API_PREFIX}/api/error-by-horizon?from=${HEADLINE_WINDOW.from}` +
+        (HEADLINE_WINDOW.to ? `&to=${HEADLINE_WINDOW.to}` : ''),
     ),
     getJson<DayResponse>(`${API_PREFIX}/api/error-by-day`),
     getJson<SummaryResponse>(`${API_PREFIX}/api/summary`),
@@ -53,6 +54,8 @@ export default async function Page() {
   );
 
   const series = horizon.data?.series ?? [];
+  // Labelled from the dates the Worker actually graded, not from the request.
+  const headlineLabel = windowLabel(horizon.data?.span, HEADLINE_WINDOW.label);
 
   // The OLDEST response this render used: the page is only as fresh as its
   // stalest input.
@@ -84,7 +87,7 @@ export default async function Page() {
       {!DEMO_MODE ? (
         <div className="mb-8 space-y-1">
           <p className="text-sm text-[var(--text-secondary)]">
-            Primary analysis covers {PRIMARY_WINDOW.label}. Collection was degraded{' '}
+            Primary analysis covers {headlineLabel}. Collection was degraded{' '}
             {DEGRADED_WINDOW.label} &mdash; see{' '}
             <a href="#limitations" className="underline underline-offset-2">
               limitations
@@ -107,14 +110,14 @@ export default async function Page() {
 
       {/* 1. THE FINDING, generated from data, above everything else. */}
       <section className="mb-14 border-y border-[var(--rule)] py-8">
-        <Finding series={series} windowLabel={HEADLINE_WINDOW.label} />
+        <Finding series={series} windowLabel={headlineLabel} />
       </section>
 
       {/* 2. MODE COMPARISON. */}
       <section className="mb-14">
         <h2 className="text-lg font-semibold">Accuracy by how far ahead the prediction was made</h2>
         <p className="mb-5 mt-1 max-w-2xl text-sm text-[var(--text-secondary)]">
-          {HEADLINE_WINDOW.label}. Each point is graded at a fixed horizon &mdash; the prediction that
+          {headlineLabel}. Each point is graded at a fixed horizon &mdash; the prediction that
           was on the display when the vehicle was that far away. Positive means it arrived later than
           promised.
         </p>
