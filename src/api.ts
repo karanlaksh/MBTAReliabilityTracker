@@ -17,7 +17,7 @@ import type { Env } from './collector';
 import { serviceDate } from './service-date';
 
 /** Rollups recompute once daily at 04:00 local, so a 30-minute cache is generous. */
-const CACHE_CONTROL = 'public, max-age=1800, s-maxage=3600, stale-while-revalidate=86400';
+export const CACHE_CONTROL = 'public, max-age=1800, s-maxage=3600, stale-while-revalidate=86400';
 
 const BUCKET_ORDER = ['~1.5 min', '~4.5 min', '~9 min', '~16 min'];
 const BUCKET_HORIZON: Record<string, number> = {

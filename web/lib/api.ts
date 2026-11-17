@@ -223,8 +223,8 @@ export interface SliceResponse {
  * crash and not an endless spinner, so failure is a value the page can display.
  */
 /**
- * `fetchedAt` is when the Worker produced the response (its HTTP Date header, in
- * epoch seconds), NOT when this page rendered. Next's data cache can hand back a
+ * `fetchedAt` is when the Worker produced the response (its x-generated-at
+ * header, else its HTTP Date header, in epoch seconds), NOT when this page rendered. Next's data cache can hand back a
  * stored response on a later render; the Date header travels with it, so it
  * says how old the data really is.
  */
@@ -233,8 +233,11 @@ export async function getJson<T>(
 ): Promise<{ data: T | null; error: string | null; fetchedAt: number | null }> {
   try {
     const res = await fetch(`${WORKER_BASE}${path}`, { next: { revalidate: 1800 } });
+    // x-generated-at first: the Worker's D1 response cache (src/cache.ts) can
+    // serve a body produced hours ago, and on a hit Date is only when it was SENT.
+    const generated = Number(res.headers.get('x-generated-at'));
     const date = res.headers.get('date');
-    const fetchedAt = date ? Math.floor(Date.parse(date) / 1000) : null;
+    const fetchedAt = generated > 0 ? generated : date ? Math.floor(Date.parse(date) / 1000) : null;
     if (!res.ok) return { data: null, error: `${path} returned HTTP ${res.status}`, fetchedAt };
     return { data: (await res.json()) as T, error: null, fetchedAt };
   } catch (err) {

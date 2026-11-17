@@ -101,10 +101,35 @@ export function project(
 }
 
 /**
- * The read-budget block of /status. Same projection and thresholds as writes.
+ * No read projection before this much of the UTC day has elapsed.
+ *
+ * Reads are bursty in a way writes are not: one dashboard render or /status
+ * call costs thousands of rows at once, against a collector that costs ~10 a
+ * tick. Early in the day those bursts are extrapolated across 20+ hours. On
+ * 2026-11-16 at 00:44 UTC, 212k rows (mostly six page renders and two /status
+ * calls) projected to 139% and reported 'critical' with nothing wrong, the
+ * second such false alarm. Switching to the recent-rate estimate alone would
+ * not have helped: inside the first hour it and the flat rate are the same
+ * number (both are used / elapsed).
+ *
+ * THE COST, stated: a sustained runaway is now reported later. The September
+ * pattern (~950k/hour) would have read 'critical' within the first hour; now it
+ * reads 'warn' once raw spend crosses 70% (~3.7h in) and is projected normally
+ * from 4h. The scheduled rollup's own gate (ROLLUP_MAX_READS_BEFORE in
+ * index.ts) uses raw spend and is unaffected.
+ */
+export const READ_PROJECTION_MIN_ELAPSED_SEC = 4 * 3600;
+
+/**
+ * The read-budget block of /status. Same projection and thresholds as writes,
+ * from 4 hours into the UTC day.
  *
  * When usage cannot be fetched the level is 'unknown', never 'ok'. An absent
  * counter reading as healthy is how this ran unnoticed for four weeks.
+ *
+ * Before 4 hours the level is 'not_projected', also never 'ok': too little of
+ * the day has passed to call it healthy, either. Raw spend still escalates —
+ * rows already read are not an extrapolation and cannot be a false alarm.
  */
 export function readBudget(
   usage: AccountUsage | null,
@@ -117,6 +142,27 @@ export function readBudget(
     return { limit: DAILY_READ_LIMIT, level: 'unknown', error: usageError, ...reset };
   }
   const used = usage.rows_read_today;
+  const projectionStartsAt = dayStart + READ_PROJECTION_MIN_ELAPSED_SEC;
+  if (now < projectionStartsAt) {
+    const spent = level(used / DAILY_READ_LIMIT);
+    return {
+      limit: DAILY_READ_LIMIT,
+      source: 'cloudflare_graphql_account_total',
+      used_today: used,
+      remaining: Math.max(0, DAILY_READ_LIMIT - used),
+      pct_used: Number(((100 * used) / DAILY_READ_LIMIT).toFixed(1)),
+      pct_projected: null,
+      projected_eod: null,
+      projected_by_recent_rate: null,
+      projected_by_flat_rate: null,
+      level: spent === 'ok' ? 'not_projected' : spent,
+      projection_starts_at: projectionStartsAt,
+      note: 'no projection in the first 4h of the UTC day; level reflects rows already read',
+      reads_last_hour: usage.rows_read_last_hour,
+      exhausted: used >= DAILY_READ_LIMIT,
+      ...reset,
+    };
+  }
   const projection = project(used, usage.rows_read_last_hour, now, DAILY_READ_LIMIT);
   return {
     limit: DAILY_READ_LIMIT,

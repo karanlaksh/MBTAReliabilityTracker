@@ -4,6 +4,7 @@ import { ask } from './ask';
 import { ROLLUP_FLOOR, runRollup, shouldRecompute } from './rollup';
 import { fetchAccountUsage, type AccountUsage } from './usage';
 import { errorByDay, errorByHorizon, errorBySlice, summary } from './api';
+import { cached, invalidateApiCache, ROLLUP_BACKED_TTL_SEC, SUMMARY_TTL_SEC } from './cache';
 import { buildStatus, DAILY_WRITE_LIMIT } from './status';
 
 /** Must match the second entry in wrangler.toml [triggers] crons. */
@@ -62,6 +63,7 @@ export default {
         }
         if (usage && usage.rows_read_today <= ROLLUP_MAX_READS_BEFORE) {
           const roll = await runRollup(env, Date.now(), { readsBefore: usage.rows_read_today });
+          await invalidateApiCache(env.DB);
           if (roll.error) console.error('rollup failed', roll);
           else console.log('rollup', roll);
         } else if (usage) {
@@ -124,17 +126,17 @@ export default {
       if (!env.DB_DEMO) return json({ error: 'demo database not bound' }, 404);
       const demoEnv: Env = { ...env, DB: env.DB_DEMO };
       const path = url.pathname.slice('/demo'.length);
-      if (path === '/api/error-by-horizon') return errorByHorizon(demoEnv, url);
-      if (path === '/api/error-by-day') return errorByDay(demoEnv, url);
-      if (path === '/api/error-by-slice') return errorBySlice(demoEnv, url);
-      if (path === '/api/summary') return summary(demoEnv);
-      return json({ error: 'not found' }, 404);
+      // Cached like the real paths. The cache rows live in DB, not DB_DEMO, keyed
+      // by the full /demo/... path, so the two can never serve each other's data.
+      const handler = apiHandler(demoEnv, path, url);
+      if (!handler) return json({ error: 'not found' }, 404);
+      return cached(env.DB, url, handler.ttl, Math.floor(Date.now() / 1000), handler.run);
     }
 
-    if (url.pathname === '/api/error-by-horizon') return errorByHorizon(env, url);
-    if (url.pathname === '/api/error-by-day') return errorByDay(env, url);
-    if (url.pathname === '/api/error-by-slice') return errorBySlice(env, url);
-    if (url.pathname === '/api/summary') return summary(env);
+    // Served through the D1 response cache (src/cache.ts): without it every
+    // request re-ran its queries, so page views, not rollups, set the read bill.
+    const handler = apiHandler(env, url.pathname, url);
+    if (handler) return cached(env.DB, url, handler.ttl, Math.floor(Date.now() / 1000), handler.run);
 
     // /status is canonical; /health is kept as an alias so anything already
     // pointing at it keeps working.
@@ -176,7 +178,9 @@ export default {
           : fold !== null
             ? { byDayDates: [], foldDates: [fold] }
             : {};
-      return json(await runRollup(env, Date.now(), opts));
+      const roll = await runRollup(env, Date.now(), opts);
+      await invalidateApiCache(env.DB);
+      return json(roll);
     }
 
     // Manual full backfill over all collected data, separate from the cron. Resets
@@ -243,6 +247,19 @@ export default {
     );
   },
 };
+
+/** The cacheable GET /api/* routes, with how long each answer may be reused. */
+function apiHandler(
+  env: Env,
+  path: string,
+  url: URL,
+): { ttl: number; run: () => Promise<Response> } | null {
+  if (path === '/api/error-by-horizon') return { ttl: ROLLUP_BACKED_TTL_SEC, run: () => errorByHorizon(env, url) };
+  if (path === '/api/error-by-day') return { ttl: ROLLUP_BACKED_TTL_SEC, run: () => errorByDay(env, url) };
+  if (path === '/api/error-by-slice') return { ttl: ROLLUP_BACKED_TTL_SEC, run: () => errorBySlice(env, url) };
+  if (path === '/api/summary') return { ttl: SUMMARY_TTL_SEC, run: () => summary(env) };
+  return null;
+}
 
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body, null, 2), {

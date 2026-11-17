@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { DAILY_READ_LIMIT, project, readBudget } from '../src/status';
+import { DAILY_READ_LIMIT, project, READ_PROJECTION_MIN_ELAPSED_SEC, readBudget } from '../src/status';
 
 const at = (iso: string) => Math.floor(Date.parse(iso) / 1000);
 
@@ -43,5 +43,38 @@ describe('readBudget', () => {
     expect(r.exhausted).toBe(true);
     expect(r.remaining).toBe(0);
     expect(r.level).toBe('critical');
+  });
+});
+
+describe('readBudget before 4h of the UTC day', () => {
+  const usage = (read: number, lastHour: number) => ({ rows_read_today: read, rows_read_last_hour: lastHour, rows_written_today: 0 });
+
+  it('does not project the 2026-11-16 false alarm', () => {
+    // 212,474 rows at 00:43:51 UTC projected to 139% and read 'critical'.
+    const r = readBudget(usage(212_474, 212_474), null, at('2026-11-16T00:43:51Z'));
+    expect(r.level).toBe('not_projected');
+    expect(r.projected_eod).toBeNull();
+    expect(r.pct_projected).toBeNull();
+    expect(r.used_today).toBe(212_474);
+  });
+
+  it("never reports 'ok' before a projection exists", () => {
+    expect(readBudget(usage(1_000, 1_000), null, at('2026-11-16T02:00:00Z')).level).toBe('not_projected');
+  });
+
+  it('still escalates on rows actually read', () => {
+    // The September runaway at ~950k/hour, 3.75h in: 3.56M already spent.
+    expect(readBudget(usage(3_562_500, 950_000), null, at('2026-09-27T03:45:00Z')).level).toBe('warn');
+    expect(readBudget(usage(5_000_000, 950_000), null, at('2026-09-27T03:45:00Z'))).toMatchObject({
+      level: 'critical',
+      exhausted: true,
+    });
+  });
+
+  it('projects normally from 4h', () => {
+    const t = at('2026-11-16T00:00:00Z') + READ_PROJECTION_MIN_ELAPSED_SEC;
+    const r = readBudget(usage(1_000_000, 250_000), null, t);
+    expect(r.projected_eod).not.toBeNull();
+    expect(r.level).toBe('critical'); // 1M + 250k/h x 20h = 6M
   });
 });
